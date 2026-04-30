@@ -30,6 +30,12 @@ class GeminiAuth(AuthBase):
         self._nonce_creator = NonceCreator.for_seconds()
 
     def _generate_nonce(self) -> int:
+        if self.time_provider is not None:
+            try:
+                synchronized_time = self.time_provider.time()
+                return self._nonce_creator.get_tracking_nonce(timestamp=synchronized_time)
+            except Exception:
+                pass
         return self._nonce_creator.get_tracking_nonce()
 
     def generate_rest_signature(self, payload_dict: dict) -> Tuple[str, str]:
@@ -86,13 +92,18 @@ class GeminiAuth(AuthBase):
 
         return request
 
-    def generate_ws_auth_headers(self) -> Dict[str, str]:
+    def generate_ws_auth_headers(self, request_path: str = "/v1/order/events") -> Dict[str, str]:
         """
         Generate authentication headers for the WebSocket order events endpoint.
-        The WS auth payload is just the base64 of the nonce string (not a JSON payload).
+        Per Gemini docs, the WS handshake uses the same payload format as REST: a JSON object
+        with "request" (the WS endpoint path) and "nonce", base64-encoded then HMAC-SHA384 signed.
         """
-        nonce = str(self._generate_nonce())
-        b64_payload = base64.b64encode(nonce.encode("utf-8")).decode("utf-8")
+        payload_dict = {
+            "request": request_path,
+            "nonce": self._generate_nonce(),
+        }
+        payload_json = json.dumps(payload_dict)
+        b64_payload = base64.b64encode(payload_json.encode("utf-8")).decode("utf-8")
         signature = hmac.new(
             self.secret_key.encode("utf-8"),
             b64_payload.encode("utf-8"),

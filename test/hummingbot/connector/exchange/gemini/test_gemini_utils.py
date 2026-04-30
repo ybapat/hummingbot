@@ -19,20 +19,26 @@ class TestGeminiUtils(unittest.TestCase):
 
     def test_default_fees(self):
         from decimal import Decimal
-        self.assertEqual(Decimal("0.001"), DEFAULT_FEES.maker_percent_fee_decimal)
-        self.assertEqual(Decimal("0.0035"), DEFAULT_FEES.taker_percent_fee_decimal)
+        self.assertEqual(Decimal("0.006"), DEFAULT_FEES.maker_percent_fee_decimal)
+        self.assertEqual(Decimal("0.012"), DEFAULT_FEES.taker_percent_fee_decimal)
 
     def test_keys_is_config_map(self):
         self.assertIsNotNone(KEYS)
 
-    def test_is_exchange_information_valid_open(self):
-        self.assertTrue(is_exchange_information_valid({"status": "open"}))
+    def test_is_exchange_information_valid_open_spot(self):
+        self.assertTrue(is_exchange_information_valid({"status": "open", "product_type": "spot"}))
 
     def test_is_exchange_information_valid_closed(self):
-        self.assertFalse(is_exchange_information_valid({"status": "closed"}))
+        self.assertFalse(is_exchange_information_valid({"status": "closed", "product_type": "spot"}))
 
     def test_is_exchange_information_valid_missing_status(self):
         self.assertFalse(is_exchange_information_valid({}))
 
     def test_is_exchange_information_valid_other_status(self):
-        self.assertFalse(is_exchange_information_valid({"status": "halted"}))
+        self.assertFalse(is_exchange_information_valid({"status": "halted", "product_type": "spot"}))
+
+    def test_is_exchange_information_valid_open_swap_rejected(self):
+        self.assertFalse(is_exchange_information_valid({"status": "open", "product_type": "swap"}))
+
+    def test_is_exchange_information_valid_open_missing_product_type(self):
+        self.assertFalse(is_exchange_information_valid({"status": "open"}))

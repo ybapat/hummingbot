@@ -38,6 +38,7 @@ class GeminiExchange(ExchangePyBase):
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 gemini_account_name: str = CONSTANTS.DEFAULT_ACCOUNT,
                  ):
         self.api_key = gemini_api_key
         self.secret_key = gemini_api_secret
@@ -46,6 +47,10 @@ class GeminiExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_trades_poll_gemini_timestamp = 1.0
         self._gemini_symbol_map: Optional[bidict] = None
+        # Master API keys (prefixed "master-") require an "account" param on
+        # every private endpoint.  Account-scoped keys do not.
+        self._is_master_key = gemini_api_key.startswith("master-")
+        self._account_name = gemini_account_name
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         # Gemini does not provide balance updates through websocket
         self.real_time_balance_update = False
@@ -65,10 +70,10 @@ class GeminiExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
-        if self._domain == CONSTANTS.DEFAULT_DOMAIN:
-            return "gemini"
-        else:
-            return f"gemini_{self._domain}"
+        # OTHER_DOMAINS registers alternate domains as full connector names
+        # (e.g. "gemini_sandbox"), so return the domain directly — prefixing
+        # would produce "gemini_gemini_sandbox" and miss AllConnectorSettings.
+        return self._domain
 
     @property
     def rate_limits_rules(self):
@@ -111,7 +116,10 @@ class GeminiExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        # Gemini discourages "exchange market" orders (no price protection) and
+        # recommends immediate-or-cancel limits instead.  We only advertise
+        # LIMIT and LIMIT_MAKER to avoid the untested market-order path.
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # Gemini uses nonce-based auth, not timestamp. Nonce errors look different.
@@ -177,23 +185,26 @@ class GeminiExchange(ExchangePyBase):
         return symbol
 
     async def _make_trading_pairs_request(self) -> Any:
-        return await self._make_trading_rules_request()
+        # Single bulk call returns ~190 symbol-name strings. We filter perpetuals
+        # by name suffix here since /v1/symbols carries no product_type field.
+        symbols_response = await self._api_get(path_url=CONSTANTS.SYMBOLS_PATH_URL)
+        return [s for s in symbols_response if not s.lower().endswith("perp")]
 
     async def _make_trading_rules_request(self) -> Any:
-        symbols_response = await self._api_get(path_url=CONSTANTS.SYMBOLS_PATH_URL)
-        # If the response is already a list of detail dicts (has "symbol" key), return directly
-        if symbols_response and isinstance(symbols_response[0], dict):
-            return symbols_response
-        # Otherwise it's a list of symbol name strings — fetch details for each
+        # Gemini has no bulk symbol-details endpoint, so iterating all ~190 symbols
+        # at startup would saturate the public rate limit. Fetch only the pairs the
+        # user is actually trading.
+        pairs = self._trading_pairs or []
         details = []
-        for symbol in symbols_response:
+        for trading_pair in pairs:
+            symbol = self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
             try:
                 detail = await self._api_get(
                     path_url=CONSTANTS.SYMBOL_DETAILS_PATH_URL.format(symbol=symbol),
                     limit_id=CONSTANTS.SYMBOL_DETAILS_PATH_URL)
                 details.append(detail)
             except Exception:
-                self.logger().debug(f"Error fetching details for {symbol}, skipping.")
+                self.logger().exception(f"Error fetching trading rule details for {trading_pair}.")
         return details
 
     async def _format_trading_rules(self, exchange_info_dict: List[Dict[str, Any]]) -> List[TradingRule]:
@@ -202,8 +213,13 @@ class GeminiExchange(ExchangePyBase):
             if not utils.is_exchange_information_valid(detail):
                 continue
             try:
-                symbol = detail["symbol"].lower()
-                trading_pair = self.trading_pair_associated_to_exchange_symbol(symbol)
+                # Use the detail's own base/quote rather than the symbol map — the
+                # latter may not be populated yet on cold start, since our sync
+                # override of trading_pair_associated_to_exchange_symbol falls back
+                # to the raw symbol (no dash) and TradingRule rejects that.
+                trading_pair = combine_to_hb_trading_pair(
+                    base=detail["base_currency"].upper(),
+                    quote=detail["quote_currency"].upper())
                 tick_size = Decimal(str(detail["tick_size"]))
                 min_order_size = Decimal(str(detail["min_order_size"]))
                 quote_increment = Decimal(str(detail["quote_increment"]))
@@ -219,14 +235,37 @@ class GeminiExchange(ExchangePyBase):
                 self.logger().exception(f"Error parsing the trading pair rule {detail}. Skipping.")
         return retval
 
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: List[Dict[str, Any]]):
-        mapping = bidict()
-        for detail in exchange_info:
-            if utils.is_exchange_information_valid(detail):
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: List[Any]):
+        # Two callers feed this with different shapes:
+        #   - cold start: list[str] from /v1/symbols (full universe of pair names)
+        #   - per-cycle: list[dict] from /v1/symbols/details/{symbol} for configured pairs
+        # The latter must merge into the existing map so we don't wipe the full pair list.
+        if exchange_info and isinstance(exchange_info[0], dict):
+            mapping = bidict(self._gemini_symbol_map) if self._gemini_symbol_map is not None else bidict()
+            for detail in exchange_info:
+                if not utils.is_exchange_information_valid(detail):
+                    continue
                 symbol = detail["symbol"].lower()
                 base = detail["base_currency"].upper()
                 quote = detail["quote_currency"].upper()
-                mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+                mapping.forceput(symbol, combine_to_hb_trading_pair(base=base, quote=quote))
+            self._set_trading_pair_symbol_map(mapping)
+            return
+
+        mapping = bidict()
+        for symbol in exchange_info:
+            split = utils.split_gemini_symbol(symbol)
+            if split is None:
+                continue
+            base, quote = split
+            mapping.forceput(symbol.lower(), combine_to_hb_trading_pair(base=base, quote=quote))
+        # Configured pairs are authoritative — overwrite any heuristic guess for them.
+        for trading_pair in self._trading_pairs or []:
+            try:
+                base, quote = trading_pair.split("-")
+            except ValueError:
+                continue
+            mapping.forceput((base + quote).lower(), combine_to_hb_trading_pair(base=base, quote=quote))
         self._set_trading_pair_symbol_map(mapping)
 
     async def _place_order(self,
@@ -249,6 +288,9 @@ class GeminiExchange(ExchangePyBase):
             "side": side,
             "type": order_type_str,
         }
+
+        if self._is_master_key:
+            api_params["account"] = self._account_name
 
         if order_type == OrderType.LIMIT_MAKER:
             api_params["options"] = ["maker-or-cancel"]
@@ -279,6 +321,8 @@ class GeminiExchange(ExchangePyBase):
         api_params = {
             "order_id": int(tracked_order.exchange_order_id),
         }
+        if self._is_master_key:
+            api_params["account"] = self._account_name
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
@@ -295,7 +339,7 @@ class GeminiExchange(ExchangePyBase):
                 if event_type is None:
                     continue
 
-                if event_type in ("accepted", "booked", "cancelled", "rejected", "closed"):
+                if event_type in ("initial", "accepted", "booked", "cancelled", "rejected", "closed"):
                     client_order_id = event_message.get("client_order_id")
                     exchange_order_id = str(event_message.get("order_id", ""))
 
@@ -310,7 +354,21 @@ class GeminiExchange(ExchangePyBase):
                     if tracked_order is None or client_order_id is None:
                         continue
 
-                    new_state = CONSTANTS.ORDER_STATE.get(event_type, OrderState.FAILED)
+                    if event_type == "closed":
+                        # "closed" fires for both filled and cancelled orders.
+                        # Inspect the event fields to determine the true state.
+                        is_cancelled = event_message.get("is_cancelled", False)
+                        remaining = Decimal(str(event_message.get("remaining_amount", "0")))
+                        executed = Decimal(str(event_message.get("executed_amount", "0")))
+                        if is_cancelled:
+                            new_state = OrderState.CANCELED
+                        elif remaining == Decimal("0") and executed > Decimal("0"):
+                            new_state = OrderState.FILLED
+                        else:
+                            new_state = OrderState.CANCELED
+                    else:
+                        new_state = CONSTANTS.ORDER_STATE.get(event_type, OrderState.FAILED)
+
                     order_update = OrderUpdate(
                         trading_pair=tracked_order.trading_pair,
                         update_timestamp=float(event_message.get("timestampms", 0)) * 1e-3,
@@ -385,9 +443,12 @@ class GeminiExchange(ExchangePyBase):
         if order.exchange_order_id is not None:
             trading_pair = order.trading_pair
             try:
+                trades_params = {"symbol": self.exchange_symbol_associated_to_pair(trading_pair)}
+                if self._is_master_key:
+                    trades_params["account"] = self._account_name
                 all_fills_response = await self._api_post(
                     path_url=CONSTANTS.MY_TRADES_PATH_URL,
-                    data={"symbol": self.exchange_symbol_associated_to_pair(trading_pair)},
+                    data=trades_params,
                     is_auth_required=True)
 
                 for trade in all_fills_response:
@@ -420,9 +481,12 @@ class GeminiExchange(ExchangePyBase):
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        status_params = {"order_id": int(tracked_order.exchange_order_id)}
+        if self._is_master_key:
+            status_params["account"] = self._account_name
         updated_order_data = await self._api_post(
             path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
-            data={"order_id": int(tracked_order.exchange_order_id)},
+            data=status_params,
             is_auth_required=True)
 
         is_live = updated_order_data.get("is_live", False)
@@ -454,9 +518,12 @@ class GeminiExchange(ExchangePyBase):
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
+        balance_params = {}
+        if self._is_master_key:
+            balance_params["account"] = self._account_name
         account_info = await self._api_post(
             path_url=CONSTANTS.BALANCES_PATH_URL,
-            data={"account": CONSTANTS.DEFAULT_ACCOUNT},
+            data=balance_params,
             is_auth_required=True)
 
         if account_info:
