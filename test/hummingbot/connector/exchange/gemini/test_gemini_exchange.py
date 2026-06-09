@@ -7,6 +7,7 @@ from bidict import bidict
 
 from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
 from hummingbot.connector.exchange.gemini.gemini_exchange import GeminiExchange
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
@@ -299,24 +300,177 @@ class GeminiExchangeTests(TestCase):
     # Order placement / cancellation
     # ------------------------------------------------------------------
 
-    def test_place_order_limit(self):
+    def _mock_send_rpc(self, **kwargs):
+        """Replace the user-stream data source's send_rpc with an AsyncMock and return it."""
+        mock = AsyncMock(**kwargs)
+        self.exchange._user_stream_tracker.data_source.send_rpc = mock
+        return mock
+
+    def test_place_order_limit_uses_ws_camelcase_schema(self):
         self._set_symbol_map()
-        self.exchange._api_post = AsyncMock(
+        send_rpc = self._mock_send_rpc(
             return_value={"order_id": 9876, "timestampms": 1700000000000})
         o_id, ts = self._async_run(self.exchange._place_order(
             order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
             trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
         self.assertEqual("9876", o_id)
         self.assertEqual(1700000000.0, ts)
-        _, kwargs = self.exchange._api_post.call_args
-        self.assertEqual(CONSTANTS.SIDE_BUY, kwargs["data"]["side"])
-        self.assertEqual(CONSTANTS.ORDER_TYPE_LIMIT, kwargs["data"]["type"])
-        self.assertNotIn("options", kwargs["data"])
+        self.assertEqual(CONSTANTS.WS_METHOD_ORDER_PLACE, send_rpc.call_args.kwargs["method"])
+        self.assertEqual(CONSTANTS.WS_ORDER_PLACE_LIMIT_ID, send_rpc.call_args.kwargs["limit_id"])
+        params = send_rpc.call_args.kwargs["params"]
+        # Binance-style camelCase/uppercase; no REST-style key leakage.
+        self.assertEqual("BTCUSD", params["symbol"])
+        self.assertEqual(CONSTANTS.WS_SIDE_BUY, params["side"])
+        self.assertEqual(CONSTANTS.WS_ORDER_TYPE_LIMIT, params["type"])
+        self.assertEqual(CONSTANTS.WS_TIF_GTC, params["timeInForce"])
+        self.assertEqual("1", params["quantity"])
+        self.assertEqual("HBOT1", params["clientOrderId"])
+        for leaked in ("request", "amount", "client_order_id", "options"):
+            self.assertNotIn(leaked, params)
 
-    def test_place_order_limit_maker_adds_option(self):
+    def test_place_order_limit_maker_uses_moc_tif(self):
         self._set_symbol_map()
+        send_rpc = self._mock_send_rpc(return_value={"order_id": 1, "timestampms": 1700000000000})
+        self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="ETH-USD", amount=Decimal("1"),
+            trade_type=TradeType.SELL, order_type=OrderType.LIMIT_MAKER, price=Decimal("100")))
+        params = send_rpc.call_args.kwargs["params"]
+        self.assertEqual("ETHUSD", params["symbol"])
+        self.assertEqual(CONSTANTS.WS_SIDE_SELL, params["side"])
+        self.assertEqual(CONSTANTS.WS_TIF_MAKER_OR_CANCEL, params["timeInForce"])
+
+    def test_place_order_resolves_id_from_stream_when_reply_omits_it(self):
+        # Reply carries no order id (Gemini delivers it on orders@account "i"); the tracked order's
+        # exchange_order_id (set by the NEW event) is the dual-branch fallback.
+        self._set_symbol_map()
+        self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="555")
+        self._mock_send_rpc(return_value={})
+        o_id, _ = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("555", o_id)
+
+    def test_place_order_sets_exchange_id_synchronously(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
+        self._mock_send_rpc(return_value={"order_id": 9876, "timestampms": 1700000000000})
+        self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("9876", order.exchange_order_id)
+
+    def test_place_order_uses_current_timestamp_when_reply_has_no_timestamp(self):
+        self._set_symbol_map()
+        self.exchange._set_current_timestamp(12345.0)
+        self._mock_send_rpc(return_value={"order_id": 9876})
+        _, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual(12345.0, ts)
+
+    def test_place_order_raises_when_no_id_and_no_tracked_order(self):
+        self._set_symbol_map()
+        self._mock_send_rpc(return_value={})  # no id, order is not tracked
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_order(
+                order_id="UNTRACKED", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+
+    def test_place_order_rpc_rejection_propagates_without_rest_fallback(self):
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=GeminiWSRPCError(code=-2010, status=400, message="rejected"))
+        rest = AsyncMock()
+        self.exchange._api_post = rest
+        with self.assertRaises(GeminiWSRPCError):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        rest.assert_not_called()
+
+    def test_place_order_transport_error_falls_back_to_rest(self):
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(
-            return_value={"order_id": 1, "timestampms": 0})
+            return_value={"order_id": 9876, "timestampms": 1700000000000})
+        o_id, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("9876", o_id)
+        self.exchange._api_post.assert_awaited_once()
+        # REST builder uses the lower-case REST schema.
+        _, kwargs = self.exchange._api_post.call_args
+        self.assertEqual("btcusd", kwargs["data"]["symbol"])
+        self.assertEqual(CONSTANTS.SIDE_BUY, kwargs["data"]["side"])
+
+    def test_place_order_transport_error_propagates_when_ws_required(self):
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        rest = AsyncMock()
+        self.exchange._api_post = rest
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", True):
+            with self.assertRaises(IOError):
+                self._async_run(self.exchange._place_order(
+                    order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        rest.assert_not_called()
+
+    def test_place_cancel_returns_true_on_explicit_flag(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        send_rpc = self._mock_send_rpc(return_value={"is_cancelled": True})
+        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+        self.assertEqual(CONSTANTS.WS_METHOD_ORDER_CANCEL, send_rpc.call_args.kwargs["method"])
+        self.assertEqual({"orderId": "123"}, send_rpc.call_args.kwargs["params"])
+
+    def test_place_cancel_returns_true_on_cancelled_alias(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(return_value={"cancelled": True})
+        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+
+    def test_place_cancel_returns_false_without_confirmation(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(return_value={"status": "accepted"})
+        self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+
+    def test_place_cancel_transport_error_falls_back_to_rest(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
+        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+        self.exchange._api_post.assert_awaited_once()
+
+    def test_place_cancel_not_found_propagates_and_matches_predicate(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        err = GeminiWSRPCError(code=-2010, status=400, message="not found")
+        self._mock_send_rpc(side_effect=err)
+        rest = AsyncMock()
+        self.exchange._api_post = rest
+        with self.assertRaises(GeminiWSRPCError):
+            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        rest.assert_not_called()
+        # The not-found error must satisfy the connector's lost-order predicate.
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(err))
+
+    def test_place_cancel_transport_error_propagates_when_ws_required(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        rest = AsyncMock()
+        self.exchange._api_post = rest
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", True):
+            with self.assertRaises(IOError):
+                self._async_run(self.exchange._place_cancel("HBOT1", order))
+        rest.assert_not_called()
+
+    def test_place_order_rest_fallback_adds_maker_option(self):
+        # Exercises the REST fallback builder's LIMIT_MAKER branch.
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"order_id": 1, "timestampms": 0})
         self._async_run(self.exchange._place_order(
             order_id="HBOT1", trading_pair="ETH-USD", amount=Decimal("1"),
             trade_type=TradeType.SELL, order_type=OrderType.LIMIT_MAKER, price=Decimal("100")))
@@ -324,15 +478,10 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(CONSTANTS.SIDE_SELL, kwargs["data"]["side"])
         self.assertEqual(["maker-or-cancel"], kwargs["data"]["options"])
 
-    def test_place_cancel_returns_true(self):
+    def test_place_cancel_rest_fallback_returns_false(self):
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
-        self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
-        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
-
-    def test_place_cancel_returns_false(self):
-        self._set_symbol_map()
-        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": False})
         self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
 

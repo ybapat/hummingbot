@@ -149,6 +149,11 @@ class GeminiExchange(ExchangePyBase):
             is_maker = order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER)
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
+    @property
+    def _user_stream_rpc(self):
+        # The user-stream data source owns the WS RPC router on the shared authenticated socket.
+        return self._user_stream_tracker.data_source
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -157,6 +162,77 @@ class GeminiExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+        # Gemini Fast API order.place uses a Binance-style camelCase/uppercase schema. Note the symbol
+        # is UPPERCASE here (e.g. BTCUSD) whereas REST and the @trade/@depth streams use lowercase.
+        # We only support limit orders (no "exchange market").
+        params = {
+            "symbol": symbol.upper(),
+            "side": CONSTANTS.WS_SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.WS_SIDE_SELL,
+            "type": CONSTANTS.WS_ORDER_TYPE_LIMIT,
+            "timeInForce": CONSTANTS.WS_TIF_GTC,
+            "price": f"{price:f}",
+            "quantity": f"{amount:f}",
+            "clientOrderId": order_id,
+        }
+        if order_type == OrderType.LIMIT_MAKER:
+            params["timeInForce"] = CONSTANTS.WS_TIF_MAKER_OR_CANCEL
+
+        try:
+            result = await self._user_stream_rpc.send_rpc(
+                method=CONSTANTS.WS_METHOD_ORDER_PLACE,
+                params=params,
+                limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
+        except (IOError, asyncio.TimeoutError):
+            # Transport failure only. A genuine exchange rejection (GeminiWSRPCError, e.g. -1013/-2010)
+            # is intentionally NOT caught here, so it propagates loudly as a failed order rather than
+            # being silently retried over REST.
+            if not CONSTANTS.WS_ORDER_OPS_REQUIRED:
+                self.logger().warning(
+                    f"WS order.place transport failure for {order_id}; falling back to REST.")
+                return await self._place_order_rest(
+                    order_id, trading_pair, amount, trade_type, order_type, price)
+            raise
+
+        # The assigned exchange order id is guaranteed on the orders@account NEW event ("i") and may or
+        # may not also appear in this synchronous reply — resolve defensively from either source.
+        o_id = result.get("order_id")
+        if o_id is None:
+            o_id = result.get("orderId")
+        # The reply timestamp field name/units are unconfirmed (plan D12): "timestampms" is ms while a
+        # bare "timestamp" is conventionally s/ns. Route through the magnitude-detecting helper rather
+        # than assuming ms, so a seconds/ns reply is not mis-scaled by 1000x.
+        transact = result.get("timestampms")
+        if transact is None:
+            transact = result.get("timestamp")
+        if transact:
+            transact_time = CONSTANTS.convert_timestamp_to_seconds(float(transact))
+        else:
+            transact_time = self.current_timestamp
+
+        tracked_order = self._order_tracker.fetch_order(client_order_id=order_id)
+        if o_id is None:
+            if tracked_order is not None:
+                o_id = await tracked_order.get_exchange_order_id()
+            if o_id is None:
+                raise IOError(f"order.place for {order_id} returned no order id and no NEW event arrived")
+        else:
+            o_id = str(o_id)
+            if tracked_order is not None and tracked_order.exchange_order_id is None:
+                # Set synchronously so a cancel of this just-placed order unblocks immediately and the
+                # optimistic-OPEN regression window is minimized.
+                tracked_order.update_exchange_order_id(o_id)
+
+        return o_id, transact_time
+
+    async def _place_order_rest(self,
+                                order_id: str,
+                                trading_pair: str,
+                                amount: Decimal,
+                                trade_type: TradeType,
+                                order_type: OrderType,
+                                price: Decimal) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         side = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
 
@@ -187,9 +263,30 @@ class GeminiExchange(ExchangePyBase):
 
         return o_id, transact_time
 
-    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         if tracked_order.exchange_order_id is None:
             await tracked_order.get_exchange_order_id()
+
+        try:
+            cancel_result = await self._user_stream_rpc.send_rpc(
+                method=CONSTANTS.WS_METHOD_ORDER_CANCEL,
+                params={"orderId": str(tracked_order.exchange_order_id)},
+                limit_id=CONSTANTS.WS_ORDER_CANCEL_LIMIT_ID)
+        except (IOError, asyncio.TimeoutError):
+            # Transport failure only; cancel is idempotent so the REST fallback is always safe. A
+            # not-found GeminiWSRPCError propagates so the base lost-order handling fires.
+            if not CONSTANTS.WS_ORDER_OPS_REQUIRED:
+                self.logger().warning(
+                    f"WS order.cancel transport failure for {order_id}; falling back to REST.")
+                return await self._place_cancel_rest(tracked_order)
+            raise
+
+        # is_cancel_request_in_exchange_synchronous is True, so a truthy return flips the order to
+        # CANCELED synchronously. Confirm only on an explicit cancelled flag; otherwise return False
+        # and let the orders@account CANCELED event drive the terminal state.
+        return bool(cancel_result.get("is_cancelled", cancel_result.get("cancelled", False)))
+
+    async def _place_cancel_rest(self, tracked_order: InFlightOrder) -> bool:
         api_params = {
             "request": CONSTANTS.CANCEL_ORDER_PATH_URL,
             "order_id": int(tracked_order.exchange_order_id),

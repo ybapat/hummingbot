@@ -106,18 +106,14 @@ class GeminiAuth(AuthBase):
         }
 
     def _get_nonce(self) -> int:
-        """Nonce must be in seconds and within 30s of Gemini server time.
-        We ensure monotonic increase to avoid collisions on rapid requests,
-        but reset if the counter drifted too far ahead (e.g., after clock correction)."""
-        if self.time_provider is not None:
-            nonce = int(self.time_provider.time())
-        else:
-            nonce = int(time.time())
-        # Reset counter if it drifted more than 15 seconds ahead of current time
-        if self._last_nonce > nonce + 15:
-            self._last_nonce = 0
-        # Ensure strictly increasing nonce for rapid sequential requests
-        if nonce <= self._last_nonce:
-            nonce = self._last_nonce + 1
-        self._last_nonce = nonce
-        return nonce
+        """Nonce must be in seconds and within ~30s of Gemini server time, and strictly increasing.
+
+        This is a single read-modify-write (no await between read and store) so two near-simultaneous
+        callers — e.g. a WS reconnect handshake and a REST-fallback signing on the shared auth instance —
+        cannot compute the same value. We intentionally do NOT reset the counter downward on drift: an
+        earlier ``> nonce + 15 -> 0`` reset could regress below an already-issued nonce and trigger
+        ``InvalidNonce`` under a reconnect storm. ``max`` keeps the value anchored to wall-clock while
+        never going backward."""
+        now = int(self.time_provider.time()) if self.time_provider is not None else int(time.time())
+        self._last_nonce = max(self._last_nonce + 1, now)
+        return self._last_nonce

@@ -102,15 +102,27 @@ class GeminiAuthTests(TestCase):
         self.assertEqual(1234567891, second)
         self.assertEqual(1234567892, third)
 
-    def test_nonce_resets_when_counter_drifts_ahead(self):
+    def test_nonce_does_not_reset_below_last_issued(self):
         mock_time_provider = MagicMock()
         mock_time_provider.time.return_value = 1234567890.000
 
         auth = GeminiAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
-        # Simulate a counter that drifted far ahead of current time (e.g. clock correction)
+        # Counter drifted ahead of wall-clock (e.g. burst of requests). The nonce must NEVER regress
+        # below an already-issued value, or Gemini rejects it as InvalidNonce on reconnect.
         auth._last_nonce = 1234567890 + 100
         nonce = auth._get_nonce()
-        self.assertEqual(1234567890, nonce)
+        self.assertEqual(1234567991, nonce)
+
+    def test_nonce_monotonic_under_burst_and_clock_regression(self):
+        mock_time_provider = MagicMock()
+        # Simulate a clock that jumps backward (negative offset correction) between calls.
+        mock_time_provider.time.side_effect = [1000.0, 999.0, 998.0, 1005.0]
+
+        auth = GeminiAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+        nonces = [auth._get_nonce() for _ in range(4)]
+        # Strictly increasing regardless of the backward clock jumps.
+        self.assertEqual(nonces, sorted(nonces))
+        self.assertEqual(len(nonces), len(set(nonces)))
 
     def test_nonce_uses_local_time_without_provider(self):
         auth = GeminiAuth(api_key=self._api_key, secret_key=self._secret, time_provider=None)

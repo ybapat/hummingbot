@@ -1,0 +1,121 @@
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+
+from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError, GeminiWSRPCRouter
+
+
+class GeminiWSRPCErrorTests(IsolatedAsyncioWrapperTestCase):
+
+    def test_str_tags_order_not_found_for_not_found_codes(self):
+        err = GeminiWSRPCError(code=-2010, status=400, message="no such order")
+        self.assertIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err))
+        self.assertEqual(-2010, err.code)
+        self.assertEqual(400, err.status)
+
+    def test_str_does_not_tag_order_not_found_for_other_codes(self):
+        err = GeminiWSRPCError(code=-1003, status=429, message="slow down")
+        self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err))
+        err_none = GeminiWSRPCError(code=None, status=500, message="boom")
+        self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err_none))
+
+
+class GeminiWSRPCRouterTests(IsolatedAsyncioWrapperTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.router = GeminiWSRPCRouter()
+
+    def test_next_id_strictly_increasing_strings(self):
+        ids = [self.router.next_id() for _ in range(3)]
+        self.assertEqual(["1", "2", "3"], ids)
+        # Never collides with the reserved subscription-ack ids.
+        self.assertNotIn("user_orders", ids)
+        self.assertNotIn("user_balances", ids)
+
+    async def test_register_and_try_resolve(self):
+        future = self.router.register("1")
+        resolved = self.router.try_resolve({"id": "1", "status": 200, "result": {"order_id": 9}})
+        self.assertTrue(resolved)
+        self.assertTrue(future.done())
+        self.assertEqual({"id": "1", "status": 200, "result": {"order_id": 9}}, future.result())
+        # Pending map emptied after resolution.
+        self.assertEqual(0, len(self.router._pending))
+
+    async def test_try_resolve_numeric_id_matches_string_key(self):
+        future = self.router.register("5")
+        self.assertTrue(self.router.try_resolve({"id": 5, "status": 200, "result": {}}))
+        self.assertTrue(future.done())
+
+    def test_try_resolve_non_dict(self):
+        self.assertFalse(self.router.try_resolve(None))
+        self.assertFalse(self.router.try_resolve([1, 2, 3]))
+        self.assertFalse(self.router.try_resolve("nope"))
+
+    def test_try_resolve_missing_id(self):
+        self.assertFalse(self.router.try_resolve({"status": 200, "result": {}}))
+
+    def test_try_resolve_unknown_id(self):
+        self.assertFalse(self.router.try_resolve({"id": "999", "status": 200}))
+
+    async def test_try_resolve_ignores_order_event_without_id(self):
+        # An orders@account fill frame carries i/c but no top-level id.
+        self.router.register("1")
+        event = {"X": "FILLED", "i": "42", "c": "HBOT1", "Z": "1.0", "t": "t1"}
+        self.assertFalse(self.router.try_resolve(event))
+        # The genuine pending request is untouched.
+        self.assertIn("1", self.router._pending)
+
+    async def test_try_resolve_subscription_ack_for_unregistered_id(self):
+        self.router.register("1")
+        self.assertFalse(self.router.try_resolve({"id": "user_orders", "result": "ok"}))
+
+    async def test_try_resolve_already_done_future_does_not_raise(self):
+        future = self.router.register("1")
+        future.set_result({"pre": "set"})
+        # Reply arrives for an already-resolved future: consumed (popped) without raising.
+        self.assertTrue(self.router.try_resolve({"id": "1", "status": 200, "result": {}}))
+        self.assertEqual({"pre": "set"}, future.result())
+
+    async def test_discard_removes_pending(self):
+        self.router.register("1")
+        self.router.discard("1")
+        self.assertFalse(self.router.try_resolve({"id": "1", "status": 200}))
+        self.router.discard("does-not-exist")  # no raise
+
+    async def test_fail_all_rejects_clears_and_is_idempotent(self):
+        f1 = self.router.register("1")
+        f2 = self.router.register("2")
+        self.router.fail_all(IOError("socket gone"))
+        for fut in (f1, f2):
+            self.assertTrue(fut.done())
+            with self.assertRaises(IOError):
+                fut.result()
+        self.assertEqual(0, len(self.router._pending))
+        # Idempotent.
+        self.router.fail_all(IOError("again"))
+        # A late frame for a previously-pending id resurrects nothing.
+        self.assertFalse(self.router.try_resolve({"id": "1", "status": 200}))
+
+    def test_raise_or_return_success_returns_result(self):
+        self.assertEqual(
+            {"order_id": 9},
+            GeminiWSRPCRouter.raise_or_return({"id": "1", "status": 200, "result": {"order_id": 9}}))
+
+    def test_raise_or_return_success_without_result_returns_empty(self):
+        self.assertEqual({}, GeminiWSRPCRouter.raise_or_return({"id": "1", "status": 204}))
+
+    def test_raise_or_return_maps_error_codes(self):
+        for code, status in [
+            (CONSTANTS.WS_ERR_INTERNAL, 500),
+            (CONSTANTS.WS_ERR_AUTH, 401),
+            (CONSTANTS.WS_ERR_RATE_LIMIT, 429),
+            (CONSTANTS.WS_ERR_INVALID_PARAM, 400),
+            (CONSTANTS.WS_ERR_UNSUPPORTED, 400),
+            (CONSTANTS.WS_ERR_ORDER_REJECT, 400),
+        ]:
+            with self.subTest(code=code):
+                with self.assertRaises(GeminiWSRPCError) as ctx:
+                    GeminiWSRPCRouter.raise_or_return(
+                        {"id": "1", "status": status, "error": {"code": code, "msg": "x"}})
+                self.assertEqual(code, ctx.exception.code)
+                self.assertEqual(status, ctx.exception.status)

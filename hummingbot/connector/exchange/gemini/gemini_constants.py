@@ -26,6 +26,7 @@ WS_METHOD_UNSUBSCRIBE = "unsubscribe"
 WS_METHOD_ORDER_PLACE = "order.place"
 WS_METHOD_ORDER_CANCEL = "order.cancel"
 WS_METHOD_ORDER_CANCEL_ALL = "order.cancel_all"
+WS_METHOD_ORDER_CANCEL_SESSION = "order.cancel_session"
 WS_METHOD_PING = "ping"
 WS_METHOD_TIME = "time"
 
@@ -47,10 +48,37 @@ WS_EVENT_BALANCE_UPDATE = "balanceUpdate"
 HBOT_ORDER_ID_PREFIX = "HBOT"
 MAX_ORDER_ID_LEN = 36
 
-# Order params
+# Order params (REST)
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
 ORDER_TYPE_LIMIT = "exchange limit"
+
+# WS order-entry RPC settings
+WS_RPC_TIMEOUT = 8.0              # < InFlightOrder.GET_EX_ORDER_ID_TIMEOUT (10s)
+WS_RPC_READY_TIMEOUT = 5.0        # bound on waiting for the reader to start draining
+WS_ORDER_OPS_REQUIRED = False     # False => transport-failure REST fallback allowed
+WS_CANCEL_ON_DISCONNECT = False   # MUST stay False on the shared socket (mass-cancel footgun); wiring NOT shipped
+
+# Fast API order.place / order.cancel wire schema (Binance-style; D7/D8)
+WS_SIDE_BUY = "BUY"
+WS_SIDE_SELL = "SELL"
+WS_ORDER_TYPE_LIMIT = "LIMIT"
+WS_TIF_GTC = "GTC"
+WS_TIF_MAKER_OR_CANCEL = "MOC"    # OPEN (D7): confirm post-only/maker-or-cancel encoding against sandbox
+
+# WS RPC error codes
+WS_ERR_INTERNAL = -1000           # 500
+WS_ERR_AUTH = -1002               # 401
+WS_ERR_RATE_LIMIT = -1003         # 429
+WS_ERR_INVALID_PARAM = -1013      # 400  (genuine validation reject -> FAILED, NOT a fallback signal)
+WS_ERR_UNSUPPORTED = -1020        # 400
+WS_ERR_ORDER_REJECT = -2010       # 400
+WS_ORDER_NOT_FOUND_CODES = {-2010}   # OPEN (D8): verify exact not-found code/msg against sandbox
+
+# Dedicated WS throttle ids (separate bucket from REST ORDERS_RATE; avoids fallback double-count)
+WS_ORDER_PLACE_LIMIT_ID = "WS_ORDER_PLACE"
+WS_ORDER_CANCEL_LIMIT_ID = "WS_ORDER_CANCEL"
+WS_ORDER_RATE = "WS_ORDER_RATE"
 
 # Time
 WS_HEARTBEAT_TIME_INTERVAL = 30
@@ -120,4 +148,11 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=BALANCES_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
+    # WS order-entry limits: separate bucket from REST ORDERS_RATE so a WS->REST fallback
+    # does not double-charge the same limit.
+    RateLimit(limit_id=WS_ORDER_RATE, limit=100, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=WS_ORDER_PLACE_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(WS_ORDER_RATE, 1)]),
+    RateLimit(limit_id=WS_ORDER_CANCEL_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(WS_ORDER_RATE, 1)]),
 ]

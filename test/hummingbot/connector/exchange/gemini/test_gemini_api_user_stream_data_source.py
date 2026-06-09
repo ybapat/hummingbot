@@ -1,5 +1,6 @@
 import asyncio
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,7 +9,20 @@ from bidict import bidict
 from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
 from hummingbot.connector.exchange.gemini.gemini_api_user_stream_data_source import GeminiAPIUserStreamDataSource
 from hummingbot.connector.exchange.gemini.gemini_exchange import GeminiExchange
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
+
+
+class _ReaderWS:
+    """Minimal WSAssistant stand-in whose iter_messages yields the given frames then ends."""
+
+    def __init__(self, frames):
+        self._frames = frames
+        self.send = AsyncMock()
+
+    async def iter_messages(self):
+        for frame in self._frames:
+            yield SimpleNamespace(data=frame)
 
 
 class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
@@ -107,3 +121,118 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         sent_payloads = [call.args[0].payload for call in mock_ws.send.await_args_list]
         self.assertEqual([CONSTANTS.WS_ORDER_EVENTS_STREAM], sent_payloads[0]["params"])
         self.assertEqual([CONSTANTS.WS_BALANCE_STREAM], sent_payloads[1]["params"])
+
+    # ------------------------------------------------------------------
+    # WS order-entry RPC plumbing
+    # ------------------------------------------------------------------
+
+    async def test_process_websocket_messages_routes_rpc_reply_and_passes_events(self):
+        queue = asyncio.Queue()
+        future = self.data_source._rpc_router.register("1")
+        rpc_reply = {"id": "1", "status": 200, "result": {"order_id": 42}}
+        order_event = {"X": "NEW", "i": "42", "c": "HBOT1"}
+        await self.data_source._process_websocket_messages(_ReaderWS([rpc_reply, order_event]), queue)
+        # The correlated reply resolves its Future and is NOT enqueued.
+        self.assertTrue(future.done())
+        self.assertEqual(rpc_reply, future.result())
+        # The order event flows through to the queue unchanged.
+        self.assertEqual(1, queue.qsize())
+        self.assertEqual(order_event, queue.get_nowait())
+        # Reader clears readiness when the loop ends.
+        self.assertFalse(self.data_source._rpc_ready.is_set())
+
+    async def _await_until(self, predicate, ticks: int = 100):
+        for _ in range(ticks):
+            await asyncio.sleep(0)
+            if predicate():
+                return
+        self.fail("condition not met")
+
+    async def test_send_rpc_happy_path(self):
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()
+        self.data_source._ws_assistant = fake_ws
+        task = asyncio.ensure_future(self.data_source.send_rpc(
+            CONSTANTS.WS_METHOD_ORDER_PLACE, {"symbol": "BTCUSD"},
+            limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID))
+        await self._await_until(lambda: fake_ws.send.called)
+        sent = fake_ws.send.call_args.args[0].payload
+        self.assertEqual(CONSTANTS.WS_METHOD_ORDER_PLACE, sent["method"])
+        self.assertEqual({"symbol": "BTCUSD"}, sent["params"])
+        self.data_source._rpc_router.try_resolve(
+            {"id": sent["id"], "status": 200, "result": {"order_id": 7}})
+        self.assertEqual({"order_id": 7}, await task)
+        self.assertEqual(0, len(self.data_source._rpc_router._pending))
+
+    async def test_send_rpc_error_reply_raises(self):
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()
+        self.data_source._ws_assistant = fake_ws
+        task = asyncio.ensure_future(self.data_source.send_rpc(
+            CONSTANTS.WS_METHOD_ORDER_CANCEL, {"orderId": "1"},
+            limit_id=CONSTANTS.WS_ORDER_CANCEL_LIMIT_ID))
+        await self._await_until(lambda: fake_ws.send.called)
+        sent = fake_ws.send.call_args.args[0].payload
+        self.data_source._rpc_router.try_resolve(
+            {"id": sent["id"], "status": 400, "error": {"code": -2010, "msg": "rejected"}})
+        with self.assertRaises(GeminiWSRPCError):
+            await task
+
+    async def test_send_rpc_times_out_and_cleans_up(self):
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()
+        self.data_source._ws_assistant = fake_ws
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID,
+                timeout=0.05)
+        self.assertEqual(0, len(self.data_source._rpc_router._pending))
+
+    async def test_send_rpc_raises_when_socket_not_connected(self):
+        self.data_source._rpc_ready.set()
+        self.data_source._ws_assistant = None
+        with self.assertRaises(IOError):
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
+
+    async def test_send_rpc_normalizes_runtime_error_to_ioerror(self):
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock(side_effect=RuntimeError("WS is not connected."))
+        self.data_source._ws_assistant = fake_ws
+        with self.assertRaises(IOError):
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
+
+    async def test_send_rpc_readiness_gate_times_out(self):
+        # _rpc_ready intentionally left clear (reader not draining).
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()
+        self.data_source._ws_assistant = fake_ws
+        with patch.object(CONSTANTS, "WS_RPC_READY_TIMEOUT", 0.05):
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.data_source.send_rpc(
+                    CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
+        fake_ws.send.assert_not_called()
+
+    async def test_on_user_stream_interruption_rejects_pending_rpcs(self):
+        self.data_source._rpc_ready.set()
+        future = self.data_source._rpc_router.register("1")
+        mock_ws = MagicMock()
+        mock_ws.disconnect = AsyncMock()
+        await self.data_source._on_user_stream_interruption(mock_ws)
+        self.assertTrue(future.done())
+        with self.assertRaises(IOError):
+            future.result()
+        self.assertFalse(self.data_source._rpc_ready.is_set())
+        mock_ws.disconnect.assert_awaited_once()
+
+    async def test_stop_rejects_pending_rpcs(self):
+        future = self.data_source._rpc_router.register("1")
+        await self.data_source.stop()
+        self.assertTrue(future.done())
+        with self.assertRaises(IOError):
+            future.result()
