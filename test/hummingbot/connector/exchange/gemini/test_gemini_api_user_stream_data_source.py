@@ -100,7 +100,7 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(Exception):
             await self.data_source._subscribe_channels(mock_ws)
         self.assertTrue(self._is_logged(
-            "ERROR", "Unexpected error occurred subscribing to user stream channels..."))
+            "ERROR", "Failed to subscribe to user stream channels: Test Error"))
 
     async def test_on_user_stream_interruption_disconnects(self):
         mock_ws = MagicMock()

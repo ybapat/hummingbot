@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from hummingbot.connector.exchange.gemini.gemini_order_book import GeminiOrderBook
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessageType
 
 
@@ -55,3 +56,24 @@ class GeminiOrderBookTests(TestCase):
         self.assertEqual(12345, trade.content["trade_id"])
         self.assertEqual("50000.00", trade.content["price"])
         self.assertEqual("0.5", trade.content["amount"])
+        # MIN-9: m:True (buyer is the maker) maps to a SELL-side trade.
+        self.assertEqual(float(TradeType.SELL.value), trade.content["trade_type"])
+
+    def test_trade_message_from_exchange_buy_direction(self):
+        # MIN-9: m:False (buyer is the taker) maps to a BUY-side trade.
+        msg = {
+            "e": "trade",
+            "E": 1234567890000,
+            "s": "BTCUSD",
+            "t": 67890,
+            "p": "50000.00",
+            "q": "0.5",
+            "m": False,  # taker side
+        }
+        trade = GeminiOrderBook.trade_message_from_exchange(
+            msg, metadata={"trading_pair": "BTC-USD"}
+        )
+        self.assertEqual(OrderBookMessageType.TRADE, trade.type)
+        self.assertEqual("BTC-USD", trade.content["trading_pair"])
+        self.assertEqual(67890, trade.content["trade_id"])
+        self.assertEqual(float(TradeType.BUY.value), trade.content["trade_type"])

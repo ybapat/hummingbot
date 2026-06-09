@@ -23,7 +23,6 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _DYNAMIC_SUBSCRIBE_ID_START = 100
 
     _logger: Optional[HummingbotLogger] = None
-    _next_subscribe_id: int = _DYNAMIC_SUBSCRIBE_ID_START
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -34,6 +33,7 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._trade_messages_queue_key = CONSTANTS.WS_EVENT_TRADE
         self._diff_messages_queue_key = CONSTANTS.WS_EVENT_DEPTH_UPDATE
         self._api_factory = api_factory
+        self._next_subscribe_id = self._DYNAMIC_SUBSCRIBE_ID_START
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -95,9 +95,9 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...",
+                f"Failed to subscribe to order book channels for pairs={self._trading_pairs}: {e}",
                 exc_info=True
             )
             raise
@@ -132,7 +132,7 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         # Skip subscription acknowledgment messages
-        if "result" in raw_message or "id" in raw_message and "e" not in raw_message:
+        if "result" in raw_message or ("id" in raw_message and "e" not in raw_message):
             return
         if raw_message.get("e") == CONSTANTS.WS_EVENT_DEPTH_UPDATE:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
@@ -202,8 +202,7 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().exception(f"Unexpected error unsubscribing from {trading_pair} channels")
             return False
 
-    @classmethod
-    def _get_next_subscribe_id(cls) -> int:
-        current_id = cls._next_subscribe_id
-        cls._next_subscribe_id += 1
+    def _get_next_subscribe_id(self) -> int:
+        current_id = self._next_subscribe_id
+        self._next_subscribe_id += 1
         return current_id

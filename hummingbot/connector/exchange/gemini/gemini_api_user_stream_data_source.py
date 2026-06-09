@@ -84,9 +84,9 @@ class GeminiAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().info("Subscribed to user order events and balance update channels...")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             self.logger().error(
-                "Unexpected error occurred subscribing to user stream channels...",
+                f"Failed to subscribe to user stream channels: {e}",
                 exc_info=True
             )
             raise

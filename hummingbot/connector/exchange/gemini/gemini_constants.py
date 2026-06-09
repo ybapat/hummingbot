@@ -9,6 +9,7 @@ WSS_FAST_API_URL = "wss://wsapi.fast.gemini.com"
 # Public
 SYMBOLS_PATH_URL = "/v1/symbols"
 SYMBOL_DETAILS_PATH_URL = "/v1/symbols/details/{}"
+SYMBOL_DETAILS_ALL_PATH_URL = "/v1/symbols/details/all"
 TICKER_PATH_URL = "/v2/ticker/{}"
 ORDER_BOOK_PATH_URL = "/v1/book/{}"
 
@@ -95,17 +96,27 @@ ONE_DAY = 86400
 MAX_REQUEST = 600
 
 # Order States
+# Union of both spellings Gemini emits: the REST /v1/order/status surface uses lowercase
+# words ("live"/"cancelled"/...) while the Fast API user stream mirrors Binance's
+# executionReport with UPPERCASE status codes ("NEW"/"PARTIALLY_FILLED"/...). Keep both so a
+# single lookup handles either surface (CONC-10).
 ORDER_STATE = {
+    # --- REST /v1/order/status spellings (lowercase) ---
     "live": OrderState.OPEN,
     "accepted": OrderState.OPEN,
-    "NEW": OrderState.OPEN,
-    "FILLED": OrderState.FILLED,
-    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "cancelled": OrderState.CANCELED,
-    "CANCELED": OrderState.CANCELED,
     "rejected": OrderState.FAILED,
-    "REJECTED": OrderState.FAILED,
     "closed": OrderState.FILLED,
+    # --- Fast API user-stream spellings (UPPERCASE, Binance-style executionReport) ---
+    "NEW": OrderState.OPEN,
+    "ACCEPTED": OrderState.OPEN,
+    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+    "FILLED": OrderState.FILLED,
+    "CANCELED": OrderState.CANCELED,          # Gemini/Binance one-L spelling
+    "CANCELLED": OrderState.CANCELED,         # defensive two-L alias
+    "CANCEL_REJECTED": OrderState.OPEN,       # cancel bounced -> order still resting
+    "REJECTED": OrderState.FAILED,
+    "EXPIRED": OrderState.FAILED,
 }
 
 # Error codes
@@ -115,7 +126,12 @@ INVALID_ORDER_ERROR = "InvalidOrderId"
 
 def convert_timestamp_to_seconds(ts: float) -> float:
     """Convert a Gemini Fast API timestamp to seconds.
-    The Fast API uses nanoseconds for trade/order events and milliseconds for balance updates."""
+
+    The Fast API uses nanoseconds for trade/order events and milliseconds for balance updates;
+    this picks the divisor by magnitude. It assumes ``ts`` is a present, positive value and does
+    NOT guard against ``None``/0/negative inputs — callers must check for a missing timestamp and
+    substitute a sensible default before calling (this function intentionally does not raise so
+    those call-site guards stay the single source of truth)."""
     if ts > 1e15:
         return ts / 1e9
     elif ts > 1e11:
@@ -129,6 +145,8 @@ RATE_LIMITS = [
     RateLimit(limit_id=SYMBOLS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=SYMBOL_DETAILS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
+    RateLimit(limit_id=SYMBOL_DETAILS_ALL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=TICKER_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),

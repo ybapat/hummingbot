@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from hummingbot.connector.exchange.gemini.gemini_constants import convert_timestamp_to_seconds
 from hummingbot.core.data_type.common import TradeType
@@ -10,7 +10,7 @@ class GeminiOrderBook(OrderBook):
 
     @classmethod
     def snapshot_message_from_exchange(cls,
-                                       msg: Dict[str, any],
+                                       msg: Dict[str, Any],
                                        timestamp: float,
                                        metadata: Optional[Dict] = None) -> OrderBookMessage:
         if metadata:
@@ -24,7 +24,7 @@ class GeminiOrderBook(OrderBook):
 
     @classmethod
     def diff_message_from_exchange(cls,
-                                   msg: Dict[str, any],
+                                   msg: Dict[str, Any],
                                    timestamp: Optional[float] = None,
                                    metadata: Optional[Dict] = None) -> OrderBookMessage:
         if metadata:
@@ -38,7 +38,7 @@ class GeminiOrderBook(OrderBook):
         }, timestamp=timestamp)
 
     @classmethod
-    def trade_message_from_exchange(cls, msg: Dict[str, any], metadata: Optional[Dict] = None):
+    def trade_message_from_exchange(cls, msg: Dict[str, Any], metadata: Optional[Dict] = None):
         if metadata:
             msg.update(metadata)
         ts = msg.get("E", 0)

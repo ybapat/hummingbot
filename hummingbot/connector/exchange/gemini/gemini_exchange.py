@@ -1,4 +1,6 @@
 import asyncio
+import decimal
+import math
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,12 +15,22 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+def _to_gemini_order_id(exchange_order_id) -> int:
+    """Coerce a tracked exchange_order_id into the integer Gemini's REST order endpoints expect.
+
+    Raises ValueError if the value is missing or not an all-digit string, rather than letting a
+    bare ``int(...)`` blow up with an opaque message (CONC-8)."""
+    if not exchange_order_id or not str(exchange_order_id).isdigit():
+        raise ValueError(f"Invalid Gemini exchange_order_id: {exchange_order_id!r}")
+    return int(exchange_order_id)
 
 
 class GeminiExchange(ExchangePyBase):
@@ -69,11 +81,15 @@ class GeminiExchange(ExchangePyBase):
 
     @property
     def trading_rules_request_path(self):
-        return CONSTANTS.SYMBOLS_PATH_URL
+        # Bulk details endpoint: one call returns base/quote/increments for every symbol, so we
+        # avoid the old per-symbol N+1 fetch in _format_trading_rules (CRIT-10/CONC-1).
+        return CONSTANTS.SYMBOL_DETAILS_ALL_PATH_URL
 
     @property
     def trading_pairs_request_path(self):
-        return CONSTANTS.SYMBOLS_PATH_URL
+        # Same bulk endpoint: authoritative base_currency/quote_currency avoid the brittle
+        # heuristic symbol split.
+        return CONSTANTS.SYMBOL_DETAILS_ALL_PATH_URL
 
     @property
     def check_network_request_path(self):
@@ -258,8 +274,14 @@ class GeminiExchange(ExchangePyBase):
             data=api_params,
             is_auth_required=True)
 
+        if order_result.get("result") == "error":
+            reason = order_result.get("reason") or order_result.get("message") or order_result
+            raise IOError(f"Gemini rejected order.new: {reason}")
+        if "order_id" not in order_result or "timestampms" not in order_result:
+            raise IOError(f"Malformed Gemini order.new response (missing order_id/timestampms): {order_result}")
+
         o_id = str(order_result["order_id"])
-        transact_time = order_result.get("timestampms", 0) * 1e-3
+        transact_time = order_result["timestampms"] * 1e-3
 
         return o_id, transact_time
 
@@ -289,59 +311,64 @@ class GeminiExchange(ExchangePyBase):
     async def _place_cancel_rest(self, tracked_order: InFlightOrder) -> bool:
         api_params = {
             "request": CONSTANTS.CANCEL_ORDER_PATH_URL,
-            "order_id": int(tracked_order.exchange_order_id),
+            "order_id": _to_gemini_order_id(tracked_order.exchange_order_id),
         }
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
-        if cancel_result.get("is_cancelled", False):
-            return True
-        return False
+        if cancel_result.get("result") == "error":
+            reason = cancel_result.get("reason", "")
+            if reason in (CONSTANTS.ORDER_NOT_FOUND_ERROR, "OrderNotFound"):
+                # Tag the message so _is_order_not_found_during_cancelation_error matches and the
+                # base lost-order handling fires instead of treating this as a generic failure.
+                raise IOError(f"OrderNotFound: {cancel_result}")
+            raise IOError(f"Gemini rejected order.cancel: {reason or cancel_result.get('message') or cancel_result}")
+        return bool(cancel_result.get("is_cancelled", False))
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
-        Gemini's /v1/symbols returns a list of symbol strings.
-        We need to fetch details for each symbol individually.
+        Build TradingRules from the bulk /v1/symbols/details/all response — a list of dicts, one
+        per symbol — so there is no per-symbol N+1 HTTP fetch (CRIT-10/CONC-1). Each entry carries
+        the authoritative increments: tick_size = base amount increment, quote_increment = price
+        increment, min_order_size = minimum base size.
         """
         retval = []
-        # exchange_info_dict is the response from /v1/symbols, which is a list of symbol strings
-        symbols = exchange_info_dict if isinstance(exchange_info_dict, list) else []
+        entries = exchange_info_dict if isinstance(exchange_info_dict, list) else []
+        skipped = 0
 
-        for symbol in symbols:
+        for entry in entries:
             try:
-                # Check if this symbol maps to one of our trading pairs
+                # The bulk endpoint reports symbols UPPERCASE ("BTCUSD"), but the symbol map is keyed
+                # lowercase (see _initialize_trading_pair_symbols_from_exchange_info) to match REST
+                # paths and the @trade/@depth streams, so look up with the lowercased symbol.
+                symbol = entry["symbol"].lower()
                 try:
                     trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
                 except KeyError:
                     continue
 
-                rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-                details = await rest_assistant.execute_request(
-                    url=web_utils.public_rest_url(
-                        path_url=CONSTANTS.SYMBOL_DETAILS_PATH_URL.format(symbol)),
-                    method=RESTMethod.GET,
-                    throttler_limit_id=CONSTANTS.SYMBOL_DETAILS_PATH_URL,
-                )
-
-                min_order_size = Decimal(str(details.get("min_order_size", "0.00001")))
-                tick_size = Decimal(str(details.get("tick_size", "1e-8")))
-                quote_increment = Decimal(str(details.get("quote_increment", "0.01")))
+                if any(k not in entry for k in ("min_order_size", "tick_size", "quote_increment")):
+                    skipped += 1
+                    continue
 
                 retval.append(
                     TradingRule(
                         trading_pair,
-                        min_order_size=min_order_size,
-                        min_price_increment=quote_increment,
-                        min_base_amount_increment=tick_size,
-                        min_notional_size=min_order_size * quote_increment,
+                        min_order_size=Decimal(str(entry["min_order_size"])),
+                        min_price_increment=Decimal(str(entry["quote_increment"])),
+                        min_base_amount_increment=Decimal(str(entry["tick_size"])),
+                        # No min_notional_size: Gemini does not report a notional minimum. The old
+                        # min_order_size * quote_increment formula was wrong (mixed base size with
+                        # price increment), so we omit it rather than fabricate a value.
                     ))
             except Exception:
-                self.logger().exception(f"Error parsing trading pair rule for {symbol}. Skipping.")
-        return retval
+                skipped += 1
+                self.logger().exception(f"Error parsing Gemini trading rule from {entry!r}. Skipping.")
 
-    async def _status_polling_loop_fetch_updates(self):
-        await super()._status_polling_loop_fetch_updates()
+        if skipped:
+            self.logger().warning(f"Skipped {skipped} Gemini symbol(s) while building trading rules.")
+        return retval
 
     async def _update_trading_fees(self):
         pass
@@ -359,9 +386,18 @@ class GeminiExchange(ExchangePyBase):
         """
         async for event_message in self._iter_user_event_queue():
             try:
+                # Route by explicit event type "e". Order events sometimes omit "e" but always
+                # carry the order-status field "X", so accept either (CONC-4).
                 event_type = event_message.get("e")
 
-                if "X" in event_message:
+                # Resolve the event timestamp once (CRIT-9). "E" may be absent; convert_timestamp_to_seconds
+                # assumes a present positive value, so guard here and fall back to current_timestamp.
+                event_ts = event_message.get("E")
+                ts_seconds = (
+                    CONSTANTS.convert_timestamp_to_seconds(event_ts) if event_ts else self.current_timestamp
+                )
+
+                if event_type in (None, CONSTANTS.WS_EVENT_ORDER_UPDATE) and "X" in event_message:
                     # Order event — identified by presence of "X" (order status) field
                     order_status = event_message.get("X", "")
                     client_order_id = event_message.get("c", "")
@@ -378,12 +414,27 @@ class GeminiExchange(ExchangePyBase):
                     if order_status in ("PARTIALLY_FILLED", "FILLED"):
                         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                         trade_id_raw = event_message.get("t")
+                        # CRIT-2: a fill status with no trade id cannot be deduped/recorded safely.
+                        # Skip the WHOLE event (don't fall through to the status update) so the order
+                        # is not prematurely advanced to FILLED without its fill; REST polling will
+                        # reconcile the missing trade.
+                        if tracked_order is not None and trade_id_raw in (None, ""):
+                            self.logger().error(
+                                f"Gemini fill event for {client_order_id} is missing a trade id (status="
+                                f"{order_status}); skipping — REST polling will reconcile.")
+                            continue
                         if tracked_order is not None and trade_id_raw not in (None, ""):
                             cumulative_z = Decimal(str(event_message.get("Z", "0")))
                             prior_filled = tracked_order.executed_amount_base
                             fill_amount = max(Decimal("0"), cumulative_z - prior_filled)
                             if fill_amount > Decimal("0"):
                                 fill_price = Decimal(str(event_message["L"]))
+                                # CONC-6: reject a non-finite or non-positive fill price.
+                                if not fill_price.is_finite() or fill_price <= 0:
+                                    self.logger().error(
+                                        f"Gemini fill event for {client_order_id} has invalid price "
+                                        f"{event_message.get('L')!r}; skipping.")
+                                    continue
                                 trade_id = str(trade_id_raw)
                                 is_maker = tracked_order.order_type in (
                                     OrderType.LIMIT, OrderType.LIMIT_MAKER)
@@ -398,18 +449,19 @@ class GeminiExchange(ExchangePyBase):
                                     fill_base_amount=fill_amount,
                                     fill_quote_amount=fill_amount * fill_price,
                                     fill_price=fill_price,
-                                    fill_timestamp=CONSTANTS.convert_timestamp_to_seconds(
-                                        event_message.get("E", 0)),
+                                    fill_timestamp=ts_seconds,
                                 )
                                 self._order_tracker.process_trade_update(trade_update)
 
                     # Process order status update
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                    if tracked_order is not None and order_status not in CONSTANTS.ORDER_STATE:
+                        self.logger().warning(
+                            f"Unrecognized Gemini order status: {order_status} for {client_order_id}")
                     if tracked_order is not None and order_status in CONSTANTS.ORDER_STATE:
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
-                            update_timestamp=CONSTANTS.convert_timestamp_to_seconds(
-                                event_message.get("E", 0)),
+                            update_timestamp=ts_seconds,
                             new_state=CONSTANTS.ORDER_STATE[order_status],
                             client_order_id=client_order_id,
                             exchange_order_id=str(event_message.get("i", "")),
@@ -422,14 +474,30 @@ class GeminiExchange(ExchangePyBase):
                         asset_name = balance_entry.get("a", "")
                         available = Decimal(str(balance_entry.get("f", "0")))
                         if asset_name:
+                            # MIN-6: the WS balance stream carries only the available amount ("f").
+                            # Update ONLY available here; the REST _update_balances owns total
+                            # ("amount") so we don't clobber it with a partial value.
                             self._account_available_balances[asset_name] = available
-                            self._account_balances[asset_name] = available
+                        else:
+                            self.logger().warning(
+                                f"Gemini balance update entry missing asset name (schema drift): {balance_entry}")
+
+                elif "result" in event_message or "subscriptions" in event_message:
+                    # Subscription ack / control frame — Gemini acks carry "result" (same marker the
+                    # order book data source filters on). Expected on every (re)connect; ignore quietly
+                    # so they don't drown out the genuine-drift warning below.
+                    pass
+
+                else:
+                    self.logger().warning(
+                        f"Unrecognized Gemini user-stream event type={event_type} keys={list(event_message)}")
 
             except asyncio.CancelledError:
                 raise
+            except (KeyError, ValueError, TypeError, decimal.InvalidOperation):
+                self.logger().error(f"Malformed Gemini user-stream event: {event_message}", exc_info=True)
             except Exception:
-                self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
-                await self._sleep(5.0)
+                self.logger().exception("Unexpected error in Gemini user stream listener.")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
@@ -446,6 +514,9 @@ class GeminiExchange(ExchangePyBase):
                     },
                     is_auth_required=True,
                     limit_id=CONSTANTS.MY_TRADES_PATH_URL)
+
+                if not isinstance(all_fills_response, list):
+                    raise IOError(f"Gemini mytrades returned non-list response: {all_fills_response}")
 
                 for trade in all_fills_response:
                     if str(trade.get("order_id", "")) == order.exchange_order_id:
@@ -470,8 +541,14 @@ class GeminiExchange(ExchangePyBase):
                             fill_timestamp=trade["timestampms"] * 1e-3,
                         )
                         trade_updates.append(trade_update)
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                # Re-raise after logging: the base _update_orders_fills wraps this per-order call
+                # in try/except (exchange_py_base.py), so propagating only surfaces a warning there
+                # instead of silently swallowing a fetch failure (CONC-3).
                 self.logger().exception(f"Error fetching trades for order {order.client_order_id}")
+                raise
 
         return trade_updates
 
@@ -482,19 +559,35 @@ class GeminiExchange(ExchangePyBase):
             path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
             data={
                 "request": CONSTANTS.ORDER_STATUS_PATH_URL,
-                "order_id": int(tracked_order.exchange_order_id),
+                "order_id": _to_gemini_order_id(tracked_order.exchange_order_id),
             },
             is_auth_required=True)
 
-        # Determine the order state from the response
-        if updated_order_data.get("is_cancelled", False):
-            new_state = CONSTANTS.ORDER_STATE["cancelled"]
-        elif updated_order_data.get("is_live", False):
-            new_state = CONSTANTS.ORDER_STATE["live"]
-        elif Decimal(str(updated_order_data.get("remaining_amount", "0"))) == Decimal("0"):
-            new_state = CONSTANTS.ORDER_STATE["closed"]
+        if updated_order_data.get("result") == "error":
+            reason = updated_order_data.get("reason") or updated_order_data.get("message") or updated_order_data
+            raise IOError(f"Gemini order/status error for {tracked_order.client_order_id}: {reason}")
+
+        # REST /v1/order/status reports state via lowercase boolean flags plus base-amount fields.
+        is_cancelled = updated_order_data.get("is_cancelled")
+        is_live = updated_order_data.get("is_live")
+        remaining_amount = updated_order_data.get("remaining_amount")
+        executed_amount = updated_order_data.get("executed_amount")
+        if any(v is None for v in (is_cancelled, is_live, remaining_amount, executed_amount)):
+            raise IOError(
+                f"Gemini order/status missing fields (is_cancelled/is_live/remaining_amount/"
+                f"executed_amount) for {tracked_order.client_order_id}: {updated_order_data}")
+
+        if is_cancelled:
+            new_state = OrderState.CANCELED
+        elif is_live:
+            new_state = OrderState.OPEN
+        elif Decimal(str(remaining_amount)) == Decimal("0") and Decimal(str(executed_amount)) > Decimal("0"):
+            new_state = OrderState.FILLED
         else:
-            new_state = CONSTANTS.ORDER_STATE.get("live")
+            # Not live, not cancelled, and nothing left to fill (or nothing filled) => the order
+            # terminated without completing. We treat this as FAILED (rejected/expired). Pending
+            # Gemini sandbox confirmation that this branch never masks a genuine FILLED (Q-3).
+            new_state = OrderState.FAILED
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -521,6 +614,9 @@ class GeminiExchange(ExchangePyBase):
             self.logger().error(f"Error fetching Gemini balances: {e}", exc_info=True)
             raise
 
+        if not isinstance(account_info, list):
+            raise IOError(f"Gemini balances returned non-list response: {account_info}")
+
         for balance_entry in account_info:
             asset_name = balance_entry["currency"]
             # Skip derivative/contract currencies (e.g. "GEMI-BTC2602180800-HI70000")
@@ -540,35 +636,22 @@ class GeminiExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        # exchange_info is the response from /v1/symbols — a list of symbol strings like ["btcusd", "ethusd"]
-        symbols = exchange_info if isinstance(exchange_info, list) else []
-        for symbol in symbols:
+        # exchange_info is the bulk /v1/symbols/details/all response — a list of per-symbol dicts.
+        # base_currency/quote_currency are authoritative, so we no longer guess the split.
+        entries = exchange_info if isinstance(exchange_info, list) else []
+        for entry in entries:
             try:
-                # Gemini symbols are lowercase concatenated, e.g., "btcusd"
-                # We need to split them into base and quote currencies
-                base, quote = self._split_gemini_symbol(symbol)
-                if base and quote:
-                    hb_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
-                    mapping[symbol] = hb_pair
+                if entry.get("product_type", "spot") != "spot":
+                    continue
+                base = entry.get("base_currency")
+                quote = entry.get("quote_currency")
+                if not base or not quote:
+                    continue
+                mapping[entry["symbol"].lower()] = combine_to_hb_trading_pair(
+                    base=base.upper(), quote=quote.upper())
             except Exception:
-                self.logger().debug(f"Could not parse symbol {symbol}, skipping.")
+                self.logger().debug(f"Could not parse Gemini symbol entry {entry!r}, skipping.")
         self._set_trading_pair_symbol_map(mapping)
-
-    @staticmethod
-    def _split_gemini_symbol(symbol: str) -> Tuple[str, str]:
-        """
-        Splits a Gemini symbol like 'btcusd' into ('btc', 'usd').
-        Gemini uses well-known currency codes. Common quote currencies are:
-        usd, btc, eth, gbp, eur, sgd, gusd, dai, usdt
-        """
-        symbol = symbol.lower()
-        # Try known quote currencies (longest first to avoid ambiguity)
-        known_quotes = ["gusd", "usdt", "usdc", "dai", "sgd", "gbp", "eur", "usd", "btc", "eth"]
-        for quote in known_quotes:
-            if symbol.endswith(quote) and len(symbol) > len(quote):
-                base = symbol[:-len(quote)]
-                return base, quote
-        return "", ""
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -576,6 +659,18 @@ class GeminiExchange(ExchangePyBase):
         resp_json = await self._api_request(
             method=RESTMethod.GET,
             path_url=CONSTANTS.TICKER_PATH_URL.format(symbol),
+            # Pass the registered TEMPLATE limit id; without it _api_request falls back to the
+            # formatted path_url, which has no RateLimit registered and silently bypasses the
+            # throttler (CRIT-6/CONC-5).
+            limit_id=CONSTANTS.TICKER_PATH_URL,
         )
 
-        return float(resp_json.get("close", resp_json.get("last", 0)))
+        price = resp_json.get("close")
+        if price is None:
+            price = resp_json.get("last")
+        if price is None:
+            raise IOError(f"Gemini ticker for {symbol} returned no close/last price: {resp_json}")
+        price = float(price)
+        if not math.isfinite(price) or price <= 0:
+            raise IOError(f"Gemini ticker for {symbol} returned a non-positive/invalid price: {price}")
+        return price

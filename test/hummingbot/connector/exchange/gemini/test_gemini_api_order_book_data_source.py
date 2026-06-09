@@ -182,7 +182,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             await self.data_source._subscribe_channels(mock_ws)
         self.assertTrue(self._is_logged(
             "ERROR",
-            "Unexpected error occurred subscribing to order book trading and delta streams..."))
+            f"Failed to subscribe to order book channels for pairs={self.data_source._trading_pairs}: Test Error"))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_connected_websocket_assistant(self, ws_connect_mock):
@@ -219,6 +219,22 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         await self.data_source._parse_order_book_diff_message({"id": 5}, queue)
         await self.data_source._parse_order_book_diff_message({"e": "other", "s": self.ex_trading_pair}, queue)
         self.assertEqual(0, queue.qsize())
+
+    async def test_parse_order_book_diff_message_always_skips_result_acks(self):
+        # CRIT-7: a subscription ack must be skipped even when it also carries an "id" key.
+        queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message({"result": None, "id": 2}, queue)
+        self.assertEqual(0, queue.qsize())
+
+    async def test_parse_order_book_diff_message_processes_depth_with_id(self):
+        # CRIT-7: before the parentheses fix, a real depthUpdate that also carried an "id" field
+        # was wrongly skipped because `"id" in msg and "e" not in msg` bound tighter than the `or`.
+        queue = asyncio.Queue()
+        diff = self._diff_event()
+        diff["id"] = 7
+        await self.data_source._parse_order_book_diff_message(diff, queue)
+        msg: OrderBookMessage = queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.content["trading_pair"])
 
     def test_channel_originating_message(self):
         self.assertEqual(
@@ -279,6 +295,20 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(result)
 
     def test_get_next_subscribe_id_increments(self):
-        first = GeminiAPIOrderBookDataSource._get_next_subscribe_id()
-        second = GeminiAPIOrderBookDataSource._get_next_subscribe_id()
+        first = self.data_source._get_next_subscribe_id()
+        second = self.data_source._get_next_subscribe_id()
+        self.assertEqual(GeminiAPIOrderBookDataSource._DYNAMIC_SUBSCRIBE_ID_START, first)
         self.assertEqual(first + 1, second)
+
+    def test_get_next_subscribe_id_not_shared_across_instances(self):
+        # CONC-9: the counter is instance state, so two data sources must not share it.
+        other_data_source = GeminiAPIOrderBookDataSource(
+            trading_pairs=[self.trading_pair],
+            connector=self.connector,
+            api_factory=self.connector._web_assistants_factory)
+        self.data_source._get_next_subscribe_id()
+        self.data_source._get_next_subscribe_id()
+        # A freshly built instance still starts from the beginning.
+        self.assertEqual(
+            GeminiAPIOrderBookDataSource._DYNAMIC_SUBSCRIBE_ID_START,
+            other_data_source._get_next_subscribe_id())

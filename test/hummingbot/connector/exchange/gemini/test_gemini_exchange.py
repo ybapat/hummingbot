@@ -38,15 +38,6 @@ class GeminiExchangeTests(TestCase):
     def test_is_cancel_request_in_exchange_synchronous(self):
         self.assertTrue(self.exchange.is_cancel_request_in_exchange_synchronous)
 
-    def test_split_gemini_symbol(self):
-        self.assertEqual(("btc", "usd"), GeminiExchange._split_gemini_symbol("btcusd"))
-        self.assertEqual(("eth", "usd"), GeminiExchange._split_gemini_symbol("ethusd"))
-        self.assertEqual(("btc", "gusd"), GeminiExchange._split_gemini_symbol("btcgusd"))
-        self.assertEqual(("eth", "btc"), GeminiExchange._split_gemini_symbol("ethbtc"))
-        self.assertEqual(("sol", "usdt"), GeminiExchange._split_gemini_symbol("solusdt"))
-        self.assertEqual(("", ""), GeminiExchange._split_gemini_symbol("x"))
-        self.assertEqual(("matic", "usd"), GeminiExchange._split_gemini_symbol("maticusd"))
-
     def test_client_order_id_prefix(self):
         self.assertEqual("HBOT", self.exchange.client_order_id_prefix)
 
@@ -239,8 +230,8 @@ class GeminiExchangeTests(TestCase):
     def test_simple_properties(self):
         self.assertEqual("", self.exchange.domain)
         self.assertEqual(CONSTANTS.RATE_LIMITS, self.exchange.rate_limits_rules)
-        self.assertEqual(CONSTANTS.SYMBOLS_PATH_URL, self.exchange.trading_rules_request_path)
-        self.assertEqual(CONSTANTS.SYMBOLS_PATH_URL, self.exchange.trading_pairs_request_path)
+        self.assertEqual(CONSTANTS.SYMBOL_DETAILS_ALL_PATH_URL, self.exchange.trading_rules_request_path)
+        self.assertEqual(CONSTANTS.SYMBOL_DETAILS_ALL_PATH_URL, self.exchange.trading_pairs_request_path)
         self.assertEqual(CONSTANTS.SYMBOLS_PATH_URL, self.exchange.check_network_request_path)
         self.assertFalse(self.exchange.is_trading_required)
 
@@ -270,11 +261,6 @@ class GeminiExchangeTests(TestCase):
     def test_update_trading_fees_is_noop(self):
         self.assertIsNone(self._async_run(self.exchange._update_trading_fees()))
 
-    @patch.object(ExchangePyBase, "_status_polling_loop_fetch_updates", new_callable=AsyncMock)
-    def test_status_polling_loop_fetch_updates_delegates(self, super_mock):
-        self._async_run(self.exchange._status_polling_loop_fetch_updates())
-        super_mock.assert_awaited_once()
-
     @patch.object(ExchangePyBase, "_update_time_synchronizer", new_callable=AsyncMock)
     def test_update_time_synchronizer_clears_samples(self, super_mock):
         self.exchange._time_synchronizer.clear_time_offset_ms_samples = lambda: setattr(self, "_cleared", True)
@@ -290,11 +276,24 @@ class GeminiExchangeTests(TestCase):
         self.exchange._set_trading_pair_symbol_map(bidict({"btcusd": "BTC-USD", "ethusd": "ETH-USD"}))
 
     def test_initialize_trading_pair_symbols_from_exchange_info(self):
-        self.exchange._initialize_trading_pair_symbols_from_exchange_info(["btcusd", "ethusd", "x"])
+        # Bulk /v1/symbols/details/all shape: list of per-symbol dicts. base/quote come from the
+        # authoritative base_currency/quote_currency, not a heuristic split.
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info([
+            {"symbol": "BTCUSD", "base_currency": "BTC", "quote_currency": "USD", "product_type": "spot"},
+            {"symbol": "ETHUSD", "base_currency": "ETH", "quote_currency": "USD"},  # product_type defaults to spot
+            # A symbol whose naive split would mangle base/quote (2Z / RLUSD) — proves we use the fields.
+            {"symbol": "2ZRLUSD", "base_currency": "2Z", "quote_currency": "RLUSD", "product_type": "spot"},
+            # Non-spot products are skipped.
+            {"symbol": "BTCGUSDPERP", "base_currency": "BTC", "quote_currency": "GUSD", "product_type": "perpetual"},
+            # Missing currency fields are skipped.
+            {"symbol": "BADUSD", "product_type": "spot"},
+        ])
         symbol_map = self._async_run(self.exchange.trading_pair_symbol_map())
         self.assertEqual("BTC-USD", symbol_map["btcusd"])
         self.assertEqual("ETH-USD", symbol_map["ethusd"])
-        self.assertNotIn("x", symbol_map)
+        self.assertEqual("2Z-RLUSD", symbol_map["2zrlusd"])
+        self.assertNotIn("btcgusdperp", symbol_map)
+        self.assertNotIn("badusd", symbol_map)
 
     # ------------------------------------------------------------------
     # Order placement / cancellation
@@ -485,34 +484,81 @@ class GeminiExchangeTests(TestCase):
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": False})
         self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
 
+    def test_place_order_rest_error_result_raises(self):
+        # Reached via the WS transport-failure REST fallback (CRIT-4).
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "InvalidPrice"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+
+    def test_place_order_rest_missing_fields_raises(self):
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"order_id": 1})  # no timestampms
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+
+    def test_place_cancel_rest_error_result_raises(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "SomethingBad"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_cancel("HBOT1", order))
+
+    def test_place_cancel_rest_order_not_found_tagged(self):
+        # An error result whose reason is OrderNotFound is re-tagged so the lost-order predicate matches.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(
+            return_value={"result": "error", "reason": CONSTANTS.ORDER_NOT_FOUND_ERROR})
+        with self.assertRaises(IOError) as ctx:
+            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(ctx.exception))
+
+    def test_place_cancel_rest_invalid_exchange_id_raises(self):
+        # _to_gemini_order_id rejects a non-numeric exchange id (CONC-8).
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="abc")
+        self._mock_send_rpc(side_effect=IOError("socket down"))
+        self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
+        with self.assertRaises(ValueError):
+            self._async_run(self.exchange._place_cancel("HBOT1", order))
+
     # ------------------------------------------------------------------
     # Trading rules
     # ------------------------------------------------------------------
 
     def test_format_trading_rules(self):
+        # Bulk list-of-dicts; no per-symbol HTTP fetch, so no rest-assistant mock needed.
         self._set_symbol_map()
-        mock_assistant = AsyncMock()
-        mock_assistant.execute_request = AsyncMock(return_value={
-            "min_order_size": "0.001",
-            "tick_size": "0.000001",
-            "quote_increment": "0.01",
-        })
-        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=mock_assistant)
+        rules = self._async_run(self.exchange._format_trading_rules([
+            {"symbol": "BTCUSD", "min_order_size": "0.001", "tick_size": "0.000001",
+             "quote_increment": "0.01"},
+            {"symbol": "ETHUSD", "min_order_size": "0.002", "tick_size": "0.00001",
+             "quote_increment": "0.1"},
+            # Not in the symbol map -> skipped (KeyError on association).
+            {"symbol": "UNKNOWNXYZ", "min_order_size": "1", "tick_size": "1", "quote_increment": "1"},
+        ]))
 
-        rules = self._async_run(self.exchange._format_trading_rules(["btcusd", "ethusd", "unknownxyz"]))
-
-        # unknownxyz is not in the symbol map and is skipped
         self.assertEqual(2, len(rules))
         rule = next(r for r in rules if r.trading_pair == "BTC-USD")
         self.assertEqual(Decimal("0.001"), rule.min_order_size)
         self.assertEqual(Decimal("0.01"), rule.min_price_increment)
+        self.assertEqual(Decimal("0.000001"), rule.min_base_amount_increment)
 
-    def test_format_trading_rules_skips_on_error(self):
+    def test_format_trading_rules_skips_entry_missing_increments(self):
+        # An entry that lacks any of min_order_size/tick_size/quote_increment is counted and skipped.
         self._set_symbol_map()
-        mock_assistant = AsyncMock()
-        mock_assistant.execute_request = AsyncMock(side_effect=Exception("details unavailable"))
-        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=mock_assistant)
-        rules = self._async_run(self.exchange._format_trading_rules(["btcusd"]))
+        rules = self._async_run(self.exchange._format_trading_rules([
+            {"symbol": "BTCUSD", "tick_size": "0.000001", "quote_increment": "0.01"},  # no min_order_size
+        ]))
         self.assertEqual(0, len(rules))
 
     # ------------------------------------------------------------------
@@ -525,20 +571,42 @@ class GeminiExchangeTests(TestCase):
         return self._async_run(self.exchange._request_order_status(order))
 
     def test_request_order_status_cancelled(self):
-        update = self._request_status({"order_id": 123, "is_cancelled": True, "timestampms": 1700000000000})
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": True, "is_live": False,
+            "remaining_amount": "1", "executed_amount": "0", "timestampms": 1700000000000})
         self.assertEqual(OrderState.CANCELED, update.new_state)
 
     def test_request_order_status_live(self):
-        update = self._request_status({"order_id": 123, "is_live": True, "remaining_amount": "1"})
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": False, "is_live": True,
+            "remaining_amount": "1", "executed_amount": "0"})
         self.assertEqual(OrderState.OPEN, update.new_state)
 
-    def test_request_order_status_closed(self):
-        update = self._request_status({"order_id": 123, "remaining_amount": "0"})
+    def test_request_order_status_filled(self):
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": False, "is_live": False,
+            "remaining_amount": "0", "executed_amount": "1"})
         self.assertEqual(OrderState.FILLED, update.new_state)
 
-    def test_request_order_status_partial_falls_back_to_live(self):
-        update = self._request_status({"order_id": 123, "remaining_amount": "0.5"})
-        self.assertEqual(OrderState.OPEN, update.new_state)
+    def test_request_order_status_not_live_not_cancelled_remaining_maps_to_failed(self):
+        # Terminated without completing (nothing filled, remaining > 0) => FAILED (rejected/expired).
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": False, "is_live": False,
+            "remaining_amount": "0.5", "executed_amount": "0"})
+        self.assertEqual(OrderState.FAILED, update.new_state)
+
+    def test_request_order_status_error_result_raises(self):
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "Boom"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._request_order_status(order))
+
+    def test_request_order_status_missing_fields_raises(self):
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        # is_live / remaining_amount / executed_amount absent.
+        self.exchange._api_post = AsyncMock(return_value={"order_id": 123, "is_cancelled": False})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._request_order_status(order))
 
     # ------------------------------------------------------------------
     # Trade updates
@@ -558,12 +626,21 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual("1", updates[0].trade_id)
         self.assertEqual(Decimal("0.5"), updates[0].fill_base_amount)
 
-    def test_all_trade_updates_for_order_handles_exception(self):
+    def test_all_trade_updates_for_order_reraises_on_exception(self):
+        # The base _update_orders_fills wraps this call in try/except, so we re-raise (CONC-3)
+        # rather than silently swallowing the fetch failure.
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="100234")
         self.exchange._api_post = AsyncMock(side_effect=Exception("boom"))
-        updates = self._async_run(self.exchange._all_trade_updates_for_order(order))
-        self.assertEqual([], updates)
+        with self.assertRaises(Exception):
+            self._async_run(self.exchange._all_trade_updates_for_order(order))
+
+    def test_all_trade_updates_for_order_non_list_raises(self):
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="100234")
+        self.exchange._api_post = AsyncMock(return_value={"result": "error"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._all_trade_updates_for_order(order))
 
     def test_all_trade_updates_for_order_no_exchange_id(self):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="100234")
@@ -597,6 +674,11 @@ class GeminiExchangeTests(TestCase):
         with self.assertRaises(Exception):
             self._async_run(self.exchange._update_balances())
 
+    def test_update_balances_non_list_response_raises(self):
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "boom"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._update_balances())
+
     # ------------------------------------------------------------------
     # Last traded price
     # ------------------------------------------------------------------
@@ -606,12 +688,34 @@ class GeminiExchangeTests(TestCase):
         self.exchange._api_request = AsyncMock(return_value={"close": "123.45"})
         price = self._async_run(self.exchange._get_last_traded_price("BTC-USD"))
         self.assertEqual(123.45, price)
+        # Must pass the registered TEMPLATE limit id so the throttler is not bypassed (CRIT-6/CONC-5).
+        self.assertEqual(CONSTANTS.TICKER_PATH_URL, self.exchange._api_request.call_args.kwargs["limit_id"])
+
+    def test_get_last_traded_price_falls_back_to_last(self):
+        self._set_symbol_map()
+        self.exchange._api_request = AsyncMock(return_value={"last": "200"})
+        self.assertEqual(200.0, self._async_run(self.exchange._get_last_traded_price("BTC-USD")))
+
+    def test_get_last_traded_price_missing_raises(self):
+        self._set_symbol_map()
+        self.exchange._api_request = AsyncMock(return_value={})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._get_last_traded_price("BTC-USD"))
+
+    def test_get_last_traded_price_non_positive_raises(self):
+        self._set_symbol_map()
+        self.exchange._api_request = AsyncMock(return_value={"close": "0"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._get_last_traded_price("BTC-USD"))
 
     # ------------------------------------------------------------------
     # User stream — balance updates
     # ------------------------------------------------------------------
 
-    def test_user_stream_balance_update(self):
+    def test_user_stream_balance_update_sets_only_available(self):
+        # Seed a pre-existing total; the WS stream carries only "f" (available) and must NOT
+        # clobber the total — REST _update_balances owns total (MIN-6).
+        self.exchange._account_balances["USD"] = Decimal("500")
         balance_event = {
             "e": CONSTANTS.WS_EVENT_BALANCE_UPDATE,
             "E": 1700000000000,
@@ -619,13 +723,67 @@ class GeminiExchangeTests(TestCase):
         }
         self._drive_user_stream([balance_event])
         self.assertEqual(Decimal("207.39"), self.exchange._account_available_balances["USD"])
-        self.assertEqual(Decimal("207.39"), self.exchange._account_balances["USD"])
+        # Total is left untouched by the WS event.
+        self.assertEqual(Decimal("500"), self.exchange._account_balances["USD"])
+
+    def test_user_stream_balance_update_empty_asset_logs_warning(self):
+        balance_event = {
+            "e": CONSTANTS.WS_EVENT_BALANCE_UPDATE,
+            "E": 1700000000000,
+            "B": [{"a": "", "f": "1"}],
+        }
+        with patch.object(self.exchange.logger(), "warning") as warn:
+            self._drive_user_stream([balance_event])
+        self.assertTrue(warn.called)
 
     def test_user_stream_handles_unexpected_error(self):
-        # A malformed order event (status present but bad data) should be caught and logged
-        with patch.object(self.exchange, "_sleep", new_callable=AsyncMock):
-            bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
-            order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")  # noqa: F841
-            self._drive_user_stream([bad_event])
+        # A malformed order event (status present but bad data) should be caught and logged.
+        # The listener no longer sleeps on error; it just continues draining the queue (CRIT-1).
+        bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")  # noqa: F841
+        self._drive_user_stream([bad_event])
         # No fills recorded because the Decimal conversion failed and was handled
         self.assertEqual(0, len(self.exchange.in_flight_orders["HBOT1"].order_fills))
+
+    def test_user_stream_listener_does_not_sleep_on_error(self):
+        # CRIT-1: a malformed event must not stall the queue with a 5s sleep.
+        self.exchange._sleep = AsyncMock()
+        bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
+        self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._drive_user_stream([bad_event])
+        self.exchange._sleep.assert_not_called()
+
+    def test_user_stream_fill_missing_trade_id_does_not_advance_order(self):
+        # CRIT-2: a FILLED event with no trade id is skipped ENTIRELY so the order is not
+        # prematurely marked FILLED before its fill is recorded.
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123", amount="1")
+        event = self._make_fill_event(
+            client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            status="FILLED", cumulative_z="1", last_price="100", trade_id="t1")
+        event.pop("t")
+        self._drive_user_stream([event])
+        self.assertEqual(0, len(order.order_fills))
+        # Order not advanced to a terminal FILLED state by the WS event.
+        self.assertNotEqual(OrderState.FILLED, order.current_state)
+
+    def test_user_stream_fill_invalid_price_is_skipped(self):
+        # CONC-6: a non-positive/non-finite fill price is rejected and no fill is recorded.
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123", amount="1")
+        event = self._make_fill_event(
+            client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            status="PARTIALLY_FILLED", cumulative_z="0.5", last_price="0", trade_id="t1")
+        self._drive_user_stream([event])
+        self.assertEqual(0, len(order.order_fills))
+
+    def test_user_stream_unrecognized_event_type_logs_warning(self):
+        with patch.object(self.exchange.logger(), "warning") as warn:
+            self._drive_user_stream([{"e": "someUnknownEvent", "foo": 1}])
+        self.assertTrue(warn.called)
+
+    def test_user_stream_unrecognized_order_status_logs_warning(self):
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        event = {"e": CONSTANTS.WS_EVENT_ORDER_UPDATE, "E": 1_700_000_000_000_000_000,
+                 "c": order.client_order_id, "i": "123", "X": "WAT_IS_THIS"}
+        with patch.object(self.exchange.logger(), "warning") as warn:
+            self._drive_user_stream([event])
+        self.assertTrue(warn.called)

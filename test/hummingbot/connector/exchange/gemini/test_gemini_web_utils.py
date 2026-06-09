@@ -47,13 +47,14 @@ class GeminiWebUtilsTests(TestCase):
         self.assertIsNotNone(api_factory)
         self.assertEqual(0, len(api_factory._rest_pre_processors))
 
-    @patch("aiohttp.ClientSession.head")
-    def test_get_current_server_time_parses_date_header(self, head_mock):
+    @patch(
+        "hummingbot.core.web_assistant.rest_assistant.RESTAssistant.execute_request_and_get_response",
+        new_callable=AsyncMock,
+    )
+    def test_get_current_server_time_parses_date_header(self, execute_mock):
         response = MagicMock()
         response.headers = {"Date": "Wed, 21 Oct 2015 07:28:00 GMT"}
-        context = AsyncMock()
-        context.__aenter__.return_value = response
-        head_mock.return_value = context
+        execute_mock.return_value = response
 
         server_time = self.async_run_with_timeout(get_current_server_time())
 
@@ -61,8 +62,28 @@ class GeminiWebUtilsTests(TestCase):
         self.assertEqual(1445412480000.0, server_time)
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    @patch("aiohttp.ClientSession.head")
-    def test_get_current_server_time_falls_back_to_local_clock(self, head_mock, _sleep_mock):
-        head_mock.side_effect = Exception("network down")
+    @patch(
+        "hummingbot.core.web_assistant.rest_assistant.RESTAssistant.execute_request_and_get_response",
+        new_callable=AsyncMock,
+    )
+    def test_get_current_server_time_falls_back_to_local_clock(self, execute_mock, _sleep_mock):
+        execute_mock.side_effect = Exception("network down")
         server_time = self.async_run_with_timeout(get_current_server_time())
+        self.assertGreater(server_time, 0)
+
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    @patch(
+        "hummingbot.core.web_assistant.rest_assistant.RESTAssistant.execute_request_and_get_response",
+        new_callable=AsyncMock,
+    )
+    def test_get_current_server_time_missing_date_header_falls_back_to_local_clock(self, execute_mock, _sleep_mock):
+        # A 200 response without a Date header must be treated as a failed attempt and fall
+        # through to the local clock, not return a bogus 0/None.
+        response = MagicMock()
+        response.headers = {}
+        execute_mock.return_value = response
+
+        server_time = self.async_run_with_timeout(get_current_server_time())
+
+        self.assertIsNotNone(server_time)
         self.assertGreater(server_time, 0)
