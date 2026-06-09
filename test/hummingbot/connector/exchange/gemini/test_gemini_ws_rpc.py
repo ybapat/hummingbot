@@ -155,3 +155,26 @@ class GeminiWSRPCRouterTests(IsolatedAsyncioWrapperTestCase):
                         {"id": "1", "status": status, "error": {"code": code, "msg": "x"}})
                 self.assertEqual(code, ctx.exception.code)
                 self.assertEqual(status, ctx.exception.status)
+
+    def test_raise_or_return_success_without_status(self):
+        # Gemini's documented success envelope omits a top-level status; with no error and no status
+        # the present "result" must be returned rather than mis-fired as a rejection.
+        self.assertEqual(
+            {"order_id": 5},
+            GeminiWSRPCRouter.raise_or_return({"id": "1", "result": {"order_id": 5}}))
+
+    def test_raise_or_return_no_status_no_result_returns_empty(self):
+        # No error, no status, no result => an empty success result, not an error.
+        self.assertEqual({}, GeminiWSRPCRouter.raise_or_return({"id": "1"}))
+
+    def test_raise_or_return_explicit_non_2xx_still_raises(self):
+        # An explicit non-2xx status with an error payload is a rejection.
+        with self.assertRaises(GeminiWSRPCError) as ctx:
+            GeminiWSRPCRouter.raise_or_return(
+                {"id": "1", "status": 400, "error": {"code": -1013, "msg": "bad"}})
+        self.assertEqual(-1013, ctx.exception.code)
+        self.assertEqual(400, ctx.exception.status)
+        # A non-2xx status with no error payload still raises (status alone is authoritative).
+        with self.assertRaises(GeminiWSRPCError) as ctx2:
+            GeminiWSRPCRouter.raise_or_return({"id": "1", "status": 400})
+        self.assertEqual(400, ctx2.exception.status)

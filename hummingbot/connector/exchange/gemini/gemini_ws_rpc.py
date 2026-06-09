@@ -109,11 +109,17 @@ class GeminiWSRPCRouter:
         An ``error`` payload always wins: a reply that carries a non-empty ``error`` is a rejection
         even if it (inconsistently) also reports a 2xx ``status`` — otherwise such a frame would slip
         through as an empty ``result`` and the caller would mistake a rejection for success. After
-        that guard, a 2xx ``status`` returns ``result`` (or ``{}``); any other status raises.
+        that guard, a 2xx ``status`` — or an absent status with no error — returns ``result`` (or
+        ``{}``); an explicit non-2xx status raises.
         """
         error = response.get("error") or {}
         status = response.get("status")
-        if not error and isinstance(status, int) and 200 <= status < 300:
+        # Success = no error payload AND status is either an explicit 2xx code OR simply absent.
+        # Gemini's documented success envelope ({"id", "result": {...}}) may omit a top-level status;
+        # requiring an explicit 2xx int would mis-fire those replies as rejections, surfacing a
+        # genuinely-placed order as FAILED. An explicit non-2xx status, or any error payload, is still
+        # treated as a rejection.
+        if not error and (status is None or (isinstance(status, int) and 200 <= status < 300)):
             return response.get("result") or {}
         code = error.get("code")
         message = error.get("msg") or error.get("message") or ""

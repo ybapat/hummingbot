@@ -252,11 +252,18 @@ class GeminiExchange(ExchangePyBase):
         tracked_order = self._order_tracker.fetch_order(client_order_id=order_id)
         if o_id is None:
             if tracked_order is not None:
-                o_id = await tracked_order.get_exchange_order_id()
+                try:
+                    # The assigned id normally arrives on the orders@account NEW event.
+                    o_id = await tracked_order.get_exchange_order_id()
+                except asyncio.TimeoutError:
+                    # The NEW event never arrived within GET_EX_ORDER_ID_TIMEOUT. The order may still
+                    # be live on Gemini, so do NOT fail blindly — reconcile by client_order_id (a
+                    # genuinely-unplaced order then surfaces as the IOError from
+                    # _reconcile_unknown_placement, which we let propagate).
+                    return await self._reconcile_unknown_placement(order_id, trading_pair)
             if o_id is None:
-                # Neither the reply nor the orders@account NEW event yielded an id. Before failing,
-                # reconcile by client_order_id — a genuinely-unplaced order surfaces as the IOError
-                # from _reconcile_unknown_placement, which we let propagate.
+                # Untracked order with no id in the reply: reconcile by client_order_id; a genuinely-
+                # unplaced order surfaces as the IOError from _reconcile_unknown_placement.
                 return await self._reconcile_unknown_placement(order_id, trading_pair)
         else:
             o_id = str(o_id)
@@ -284,7 +291,9 @@ class GeminiExchange(ExchangePyBase):
             limit_id=CONSTANTS.ORDER_STATUS_PATH_URL)
         if resp.get("result") == "error" or "order_id" not in resp:
             raise IOError(f"Gemini order {order_id} not found after unresolved WS placement: {resp}")
-        return str(resp["order_id"]), resp.get("timestampms", 0) * 1e-3
+        transact_ms = resp.get("timestampms")
+        transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
+        return str(resp["order_id"]), transact_time
 
     async def _place_order_rest(self,
                                 order_id: str,
@@ -340,7 +349,9 @@ class GeminiExchange(ExchangePyBase):
         try:
             cancel_result = await self._user_stream_rpc.send_rpc(
                 method=CONSTANTS.WS_METHOD_ORDER_CANCEL,
-                params={"orderId": str(tracked_order.exchange_order_id)},
+                # Validate/normalize the id exactly as the REST path does (_to_gemini_order_id), so a
+                # missing/non-numeric id fails loudly instead of sending {"orderId": "None"}.
+                params={"orderId": str(_to_gemini_order_id(tracked_order.exchange_order_id))},
                 limit_id=CONSTANTS.WS_ORDER_CANCEL_LIMIT_ID)
         except (IOError, asyncio.TimeoutError, GeminiWSRPCPostSendError):
             # Transport failure OR a post-send reply loss. Unlike placement, cancel is idempotent, so
@@ -643,7 +654,8 @@ class GeminiExchange(ExchangePyBase):
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(updated_order_data["order_id"]),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=updated_order_data.get("timestampms", 0) * 1e-3,
+            update_timestamp=(float(updated_order_data["timestampms"]) * 1e-3
+                              if updated_order_data.get("timestampms") else self.current_timestamp),
             new_state=new_state,
         )
 

@@ -340,15 +340,27 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(CONSTANTS.WS_TIF_MAKER_OR_CANCEL, params["timeInForce"])
 
     def test_place_order_resolves_id_from_stream_when_reply_omits_it(self):
-        # Reply carries no order id (Gemini delivers it on orders@account "i"); the tracked order's
-        # exchange_order_id (set by the NEW event) is the dual-branch fallback.
+        # Reply carries no order id (Gemini delivers it on the orders@account NEW event "i"). The
+        # tracked order starts with exchange_order_id=None and _place_order blocks on
+        # get_exchange_order_id(); we resolve it mid-flight to simulate the NEW event arriving, and
+        # the resolved id is what _place_order returns. This genuinely exercises stream resolution
+        # rather than pre-setting the id.
         self._set_symbol_map()
-        self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="555")
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
         self._mock_send_rpc(return_value={})
-        o_id, _ = self._async_run(self.exchange._place_order(
-            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
-        self.assertEqual("555", o_id)
+
+        async def _run():
+            task = asyncio.ensure_future(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+            # Yield so _place_order reaches the blocking get_exchange_order_id() await before we set
+            # the id (simulating the orders@account NEW event).
+            await asyncio.sleep(0)
+            order.update_exchange_order_id("777")
+            return await task
+
+        o_id, _ = self._async_run(_run())
+        self.assertEqual("777", o_id)
 
     def test_place_order_sets_exchange_id_synchronously(self):
         self._set_symbol_map()
@@ -609,6 +621,49 @@ class GeminiExchangeTests(TestCase):
         with self.assertRaises(IOError):
             self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
 
+    def test_place_order_no_id_event_timeout_reconciles(self):
+        # No id in the reply AND the orders@account NEW event never arrives within the timeout:
+        # get_exchange_order_id() raising TimeoutError must route to _reconcile_unknown_placement
+        # (REST order/status by client_order_id) instead of letting the TimeoutError propagate.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
+        self._mock_send_rpc(return_value={})
+        order.get_exchange_order_id = AsyncMock(side_effect=asyncio.TimeoutError)
+        self.exchange._api_post = AsyncMock(
+            return_value={"order_id": 888, "timestampms": 1700000000000})
+        o_id, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("888", o_id)
+        self.assertEqual(1700000000.0, ts)
+
+    def test_place_order_no_id_event_timeout_reconcile_not_found_raises(self):
+        # Same timeout routing, but reconciliation finds nothing (genuinely-unplaced order) => the
+        # IOError from _reconcile_unknown_placement propagates rather than being swallowed.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
+        self._mock_send_rpc(return_value={})
+        order.get_exchange_order_id = AsyncMock(side_effect=asyncio.TimeoutError)
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "OrderNotFound"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+
+    def test_reconcile_uses_current_timestamp_when_no_timestampms(self):
+        # An untracked order with no id in the reply reconciles by client_order_id; when the REST
+        # order/status response omits timestampms, transact_time falls back to current_timestamp
+        # (NOT 0).
+        self._set_symbol_map()
+        self._mock_send_rpc(return_value={})  # no id, order is not tracked
+        self.exchange._set_current_timestamp(12345.0)
+        self.exchange._api_post = AsyncMock(return_value={"order_id": 999})  # no timestampms
+        o_id, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("999", o_id)
+        self.assertEqual(12345.0, ts)
+
     def test_place_order_no_id_reconciles(self):
         # When neither reply nor NEW event yields an id, _place_order falls back to reconciliation.
         self._set_symbol_map()
@@ -732,6 +787,16 @@ class GeminiExchangeTests(TestCase):
         with self.assertRaises(IOError):
             self._async_run(self.exchange._request_order_status(order))
 
+    def test_request_order_status_uses_current_timestamp_when_no_timestampms(self):
+        # A valid order/status response that omits timestampms must fall back to current_timestamp
+        # (NOT 0) for the OrderUpdate.update_timestamp.
+        self.exchange._set_current_timestamp(54321.0)
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": False, "is_live": True,
+            "remaining_amount": "1", "executed_amount": "0"})  # no timestampms
+        self.assertEqual(OrderState.OPEN, update.new_state)
+        self.assertEqual(54321.0, update.update_timestamp)
+
     # ------------------------------------------------------------------
     # Trade updates
     # ------------------------------------------------------------------
@@ -771,6 +836,46 @@ class GeminiExchangeTests(TestCase):
         order.update_exchange_order_id(None)
         updates = self._async_run(self.exchange._all_trade_updates_for_order(order))
         self.assertEqual([], updates)
+
+    def test_ws_and_rest_fill_dedupe_to_single_fill(self):
+        # D10: the SAME execution can arrive both via the WS user-stream event (trade id field "t")
+        # and via a REST mytrades entry (field "tid"). Because both resolve to the SAME str() trade
+        # id ("TID1"), InFlightOrder.order_fills must dedupe to exactly ONE fill regardless of which
+        # path delivered it first, and executed_amount_base must be counted only once.
+        for first in ("ws", "rest"):
+            with self.subTest(first=first):
+                self.setUp()  # fresh exchange/tracker per ordering
+                self._set_symbol_map()
+                order = self._start_tracking_limit_buy(
+                    order_id="HBOT1", exchange_order_id="100234", amount="1")
+
+                def _deliver_ws():
+                    ws_event = self._make_fill_event(
+                        client_order_id=order.client_order_id,
+                        exchange_order_id=order.exchange_order_id,
+                        status="FILLED", cumulative_z="1", last_price="100", trade_id="TID1")
+                    self._drive_user_stream([ws_event])
+
+                def _deliver_rest():
+                    self.exchange._api_post = AsyncMock(return_value=[
+                        {"tid": "TID1", "order_id": 100234, "amount": "1", "price": "100",
+                         "fee_amount": "0.1", "fee_currency": "USD", "timestampms": 1700000000000},
+                    ])
+                    updates = self._async_run(self.exchange._all_trade_updates_for_order(order))
+                    # The base _update_orders_fills applies each returned TradeUpdate to the order.
+                    for update in updates:
+                        order.update_with_trade_update(update)
+
+                if first == "ws":
+                    _deliver_ws()
+                    _deliver_rest()
+                else:
+                    _deliver_rest()
+                    _deliver_ws()
+
+                self.assertEqual(1, len(order.order_fills))
+                self.assertIn("TID1", order.order_fills)
+                self.assertEqual(Decimal("1"), order.executed_amount_base)
 
     # ------------------------------------------------------------------
     # Balances

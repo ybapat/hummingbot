@@ -112,6 +112,8 @@ ORDER_STATE = {
     # --- Fast API user-stream spellings (UPPERCASE, Binance-style executionReport) ---
     "NEW": OrderState.OPEN,
     "ACCEPTED": OrderState.OPEN,
+    "OPEN": OrderState.OPEN,                   # resting order (defensive; confirm vs the orders@account X enum)
+    "MODIFIED": OrderState.OPEN,               # amended order, still resting (defensive)
     "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "FILLED": OrderState.FILLED,
     "CANCELED": OrderState.CANCELED,          # Gemini/Binance one-L spelling
