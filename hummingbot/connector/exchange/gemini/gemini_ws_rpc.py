@@ -21,6 +21,23 @@ class GeminiWSRPCError(Exception):
             rendered = f"{CONSTANTS.ORDER_NOT_FOUND_ERROR}: {rendered}"
         super().__init__(rendered)
 
+    def is_order_not_found(self) -> bool:
+        """Typed not-found predicate: ``True`` iff ``code`` is one of ``WS_ORDER_NOT_FOUND_CODES``.
+
+        Complements the substring tagging in ``__init__`` (which keeps the connector's existing
+        ``_is_order_not_found_during_*`` string predicates firing) with a structured check callers
+        can branch on without parsing the rendered message.
+        """
+        return self.code in CONSTANTS.WS_ORDER_NOT_FOUND_CODES
+
+
+class GeminiWSRPCPostSendError(Exception):
+    """Raised when a WS RPC request was SENT to Gemini but its correlated reply was lost
+    (socket dropped / timed out) before arriving. The request MAY have been accepted by the
+    exchange, so callers must NOT blindly retry/re-place; reconcile by clientOrderId instead.
+    Distinct from IOError/asyncio.TimeoutError, which the connector treats as pre-send transport
+    failures that are safe to REST-fallback."""
+
 
 class GeminiWSRPCRouter:
     """Stateless id->Future correlation brain for Gemini WS request/response RPC.
@@ -87,12 +104,17 @@ class GeminiWSRPCRouter:
 
     @staticmethod
     def raise_or_return(response: Dict[str, Any]) -> Dict[str, Any]:
-        """Map a correlated reply to its ``result`` dict, or raise ``GeminiWSRPCError`` on a non-2xx
-        ``status``."""
-        status = response.get("status")
-        if isinstance(status, int) and 200 <= status < 300:
-            return response.get("result") or {}
+        """Map a correlated reply to its ``result`` dict, or raise ``GeminiWSRPCError``.
+
+        An ``error`` payload always wins: a reply that carries a non-empty ``error`` is a rejection
+        even if it (inconsistently) also reports a 2xx ``status`` — otherwise such a frame would slip
+        through as an empty ``result`` and the caller would mistake a rejection for success. After
+        that guard, a 2xx ``status`` returns ``result`` (or ``{}``); any other status raises.
+        """
         error = response.get("error") or {}
+        status = response.get("status")
+        if not error and isinstance(status, int) and 200 <= status < 300:
+            return response.get("result") or {}
         code = error.get("code")
         message = error.get("msg") or error.get("message") or ""
         raise GeminiWSRPCError(code=code, status=status, message=message)

@@ -9,7 +9,7 @@ from bidict import bidict
 from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
 from hummingbot.connector.exchange.gemini.gemini_api_user_stream_data_source import GeminiAPIUserStreamDataSource
 from hummingbot.connector.exchange.gemini.gemini_exchange import GeminiExchange
-from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError, GeminiWSRPCPostSendError
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 
 
@@ -85,7 +85,10 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         mock_ws.send = AsyncMock()
         await self.data_source._subscribe_channels(mock_ws)
         self.assertEqual(2, mock_ws.send.await_count)
+        # Honest log: we only sent the subscribe requests; acks (or rejections) arrive on the stream.
         self.assertTrue(self._is_logged(
+            "INFO", "Sent user order/balance subscription requests (acks arrive on the stream)..."))
+        self.assertFalse(self._is_logged(
             "INFO", "Subscribed to user order events and balance update channels..."))
 
     async def test_subscribe_channels_raises_cancel_exception(self):
@@ -180,15 +183,56 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(GeminiWSRPCError):
             await task
 
-    async def test_send_rpc_times_out_and_cleans_up(self):
+    async def test_send_rpc_times_out_post_send_and_cleans_up(self):
+        # ws.send succeeds (plain AsyncMock) but the reply never arrives: this is a POST-send loss,
+        # so send_rpc must raise GeminiWSRPCPostSendError (NOT TimeoutError) to force reconciliation
+        # by clientOrderId rather than a blind REST re-place. (Previously asserted TimeoutError;
+        # updated because the request demonstrably left the box before the timeout fired.)
         self.data_source._rpc_ready.set()
         fake_ws = MagicMock()
         fake_ws.send = AsyncMock()
         self.data_source._ws_assistant = fake_ws
-        with self.assertRaises(asyncio.TimeoutError):
+        with self.assertRaises(GeminiWSRPCPostSendError):
             await self.data_source.send_rpc(
                 CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID,
                 timeout=0.05)
+        fake_ws.send.assert_awaited_once()
+        self.assertEqual(0, len(self.data_source._rpc_router._pending))
+
+    async def test_send_rpc_post_send_reply_loss_raises_post_send_error_not_timeout(self):
+        # Mirror of the contract the sibling _place_order relies on: a successful send followed by a
+        # never-arriving reply must surface as GeminiWSRPCPostSendError, explicitly NOT TimeoutError.
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()  # send succeeds; future is never resolved
+        self.data_source._ws_assistant = fake_ws
+        with self.assertRaises(GeminiWSRPCPostSendError) as ctx:
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_CANCEL, {"orderId": "1"},
+                limit_id=CONSTANTS.WS_ORDER_CANCEL_LIMIT_ID, timeout=0.05)
+        self.assertNotIsInstance(ctx.exception, asyncio.TimeoutError)
+        fake_ws.send.assert_awaited_once()
+        self.assertEqual(0, len(self.data_source._rpc_router._pending))
+
+    async def test_send_rpc_socket_drop_after_send_raises_post_send_error(self):
+        # A socket drop AFTER a successful send (fail_all sets IOError on the pending future, as
+        # _on_user_stream_interruption/stop do) must surface as GeminiWSRPCPostSendError, NOT a bare
+        # IOError — otherwise _place_order would treat it as a safe pre-send failure and REST-re-place
+        # a possibly-live order (NEW-CRIT-1).
+        self.data_source._rpc_ready.set()
+        fake_ws = MagicMock()
+
+        def _drop(_req):
+            # Reject all pending futures mid-send, mimicking a socket teardown.
+            self.data_source._rpc_router.fail_all(IOError("socket dropped"))
+
+        fake_ws.send = AsyncMock(side_effect=_drop)
+        self.data_source._ws_assistant = fake_ws
+        with self.assertRaises(GeminiWSRPCPostSendError):
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_PLACE, {},
+                limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID, timeout=1.0)
+        fake_ws.send.assert_awaited_once()
         self.assertEqual(0, len(self.data_source._rpc_router._pending))
 
     async def test_send_rpc_raises_when_socket_not_connected(self):
@@ -236,3 +280,17 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(future.done())
         with self.assertRaises(IOError):
             future.result()
+
+    async def test_send_rpc_after_stop_raises_ioerror(self):
+        # A stopped data source stays stopped: a subsequent send_rpc fails fast with IOError
+        # (pre-send, safe to fall back) rather than parking on the readiness gate or registering
+        # a request that will never be answered.
+        await self.data_source.stop()
+        self.data_source._rpc_ready.set()  # even if readiness somehow latched, _stopping wins
+        fake_ws = MagicMock()
+        fake_ws.send = AsyncMock()
+        self.data_source._ws_assistant = fake_ws
+        with self.assertRaises(IOError):
+            await self.data_source.send_rpc(
+                CONSTANTS.WS_METHOD_ORDER_PLACE, {}, limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
+        fake_ws.send.assert_not_called()

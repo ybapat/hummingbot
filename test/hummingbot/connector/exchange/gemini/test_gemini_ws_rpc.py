@@ -1,7 +1,11 @@
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
 from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
-from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError, GeminiWSRPCRouter
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import (
+    GeminiWSRPCError,
+    GeminiWSRPCPostSendError,
+    GeminiWSRPCRouter,
+)
 
 
 class GeminiWSRPCErrorTests(IsolatedAsyncioWrapperTestCase):
@@ -17,6 +21,24 @@ class GeminiWSRPCErrorTests(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err))
         err_none = GeminiWSRPCError(code=None, status=500, message="boom")
         self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err_none))
+
+    def test_is_order_not_found_true_for_not_found_codes(self):
+        for code in CONSTANTS.WS_ORDER_NOT_FOUND_CODES:
+            with self.subTest(code=code):
+                self.assertTrue(GeminiWSRPCError(code=code, status=400, message="x").is_order_not_found())
+
+    def test_is_order_not_found_false_for_other_codes(self):
+        self.assertFalse(GeminiWSRPCError(code=-1003, status=429, message="slow down").is_order_not_found())
+        self.assertFalse(GeminiWSRPCError(code=None, status=500, message="boom").is_order_not_found())
+
+
+class GeminiWSRPCPostSendErrorTests(IsolatedAsyncioWrapperTestCase):
+
+    def test_post_send_error_is_not_an_ioerror(self):
+        err = GeminiWSRPCPostSendError("sent but reply lost")
+        self.assertIsInstance(err, Exception)
+        self.assertNotIsInstance(err, IOError)
+        self.assertFalse(issubclass(GeminiWSRPCPostSendError, IOError))
 
 
 class GeminiWSRPCRouterTests(IsolatedAsyncioWrapperTestCase):
@@ -103,6 +125,20 @@ class GeminiWSRPCRouterTests(IsolatedAsyncioWrapperTestCase):
 
     def test_raise_or_return_success_without_result_returns_empty(self):
         self.assertEqual({}, GeminiWSRPCRouter.raise_or_return({"id": "1", "status": 204}))
+
+    def test_raise_or_return_raises_on_error_payload_even_with_2xx_status(self):
+        # A reply that inconsistently reports a 2xx status but carries a non-empty error is a
+        # rejection — it must raise, not slip through as an empty result.
+        with self.assertRaises(GeminiWSRPCError) as ctx:
+            GeminiWSRPCRouter.raise_or_return(
+                {"id": "1", "status": 200, "error": {"code": -2010, "msg": "rejected"}})
+        self.assertEqual(-2010, ctx.exception.code)
+        self.assertEqual(200, ctx.exception.status)
+        # An empty/absent error with a 2xx status still returns result (guard is non-empty only).
+        self.assertEqual(
+            {"order_id": 9},
+            GeminiWSRPCRouter.raise_or_return(
+                {"id": "1", "status": 200, "error": {}, "result": {"order_id": 9}}))
 
     def test_raise_or_return_maps_error_codes(self):
         for code, status in [

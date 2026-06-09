@@ -11,6 +11,7 @@ from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS, 
 from hummingbot.connector.exchange.gemini.gemini_api_order_book_data_source import GeminiAPIOrderBookDataSource
 from hummingbot.connector.exchange.gemini.gemini_api_user_stream_data_source import GeminiAPIUserStreamDataSource
 from hummingbot.connector.exchange.gemini.gemini_auth import GeminiAuth
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError, GeminiWSRPCPostSendError
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -108,7 +109,7 @@ class GeminiExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         # Gemini doesn't have a bulk ticker endpoint, so we return an empty list
@@ -125,10 +126,14 @@ class GeminiExchange(ExchangePyBase):
         await super()._update_time_synchronizer(pass_on_non_cancelled_error=pass_on_non_cancelled_error)
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return CONSTANTS.ORDER_NOT_FOUND_ERROR in str(status_update_exception)
+        return (isinstance(status_update_exception, GeminiWSRPCError)
+                and status_update_exception.is_order_not_found()) \
+            or CONSTANTS.ORDER_NOT_FOUND_ERROR in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return CONSTANTS.ORDER_NOT_FOUND_ERROR in str(cancelation_exception)
+        return (isinstance(cancelation_exception, GeminiWSRPCError)
+                and cancelation_exception.is_order_not_found()) \
+            or CONSTANTS.ORDER_NOT_FOUND_ERROR in str(cancelation_exception)
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -168,7 +173,11 @@ class GeminiExchange(ExchangePyBase):
     @property
     def _user_stream_rpc(self):
         # The user-stream data source owns the WS RPC router on the shared authenticated socket.
-        return self._user_stream_tracker.data_source
+        ds = self._user_stream_tracker.data_source
+        if not hasattr(ds, "send_rpc"):
+            raise RuntimeError(
+                f"Gemini user-stream data source {type(ds).__name__} does not provide send_rpc")
+        return ds
 
     async def _place_order(self,
                            order_id: str,
@@ -180,20 +189,25 @@ class GeminiExchange(ExchangePyBase):
                            **kwargs) -> Tuple[str, float]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        # Gemini Fast API order.place uses a Binance-style camelCase/uppercase schema. Note the symbol
-        # is UPPERCASE here (e.g. BTCUSD) whereas REST and the @trade/@depth streams use lowercase.
-        # We only support limit orders (no "exchange market").
+        # Gemini Fast API order.place uses a Binance-style camelCase schema. Note the symbol is sent
+        # LOWERCASE (e.g. btcusd) — the symbol from the map is already lowercase, matching REST and the
+        # @trade/@depth streams.
         params = {
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "side": CONSTANTS.WS_SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.WS_SIDE_SELL,
-            "type": CONSTANTS.WS_ORDER_TYPE_LIMIT,
-            "timeInForce": CONSTANTS.WS_TIF_GTC,
-            "price": f"{price:f}",
             "quantity": f"{amount:f}",
             "clientOrderId": order_id,
         }
-        if order_type == OrderType.LIMIT_MAKER:
-            params["timeInForce"] = CONSTANTS.WS_TIF_MAKER_OR_CANCEL
+        if order_type == OrderType.MARKET:
+            # Market orders carry no price; IOC is our market-order TIF.
+            params["type"] = CONSTANTS.WS_ORDER_TYPE_MARKET
+            params["timeInForce"] = CONSTANTS.WS_TIF_IOC
+        else:
+            params["type"] = CONSTANTS.WS_ORDER_TYPE_LIMIT
+            params["price"] = f"{price:f}"
+            params["timeInForce"] = (
+                CONSTANTS.WS_TIF_MAKER_OR_CANCEL if order_type == OrderType.LIMIT_MAKER
+                else CONSTANTS.WS_TIF_GTC)
 
         try:
             result = await self._user_stream_rpc.send_rpc(
@@ -201,29 +215,37 @@ class GeminiExchange(ExchangePyBase):
                 params=params,
                 limit_id=CONSTANTS.WS_ORDER_PLACE_LIMIT_ID)
         except (IOError, asyncio.TimeoutError):
-            # Transport failure only. A genuine exchange rejection (GeminiWSRPCError, e.g. -1013/-2010)
-            # is intentionally NOT caught here, so it propagates loudly as a failed order rather than
-            # being silently retried over REST.
+            # Pre-send transport failure only. A genuine exchange rejection (GeminiWSRPCError, e.g.
+            # -1013/-2010) is intentionally NOT caught here, so it propagates loudly as a failed order
+            # rather than being silently retried over REST.
             if not CONSTANTS.WS_ORDER_OPS_REQUIRED:
                 self.logger().warning(
                     f"WS order.place transport failure for {order_id}; falling back to REST.")
+                # For MARKET orders the REST fallback raises (Gemini REST has no market type), which is
+                # correct — there is no safe REST equivalent.
                 return await self._place_order_rest(
                     order_id, trading_pair, amount, trade_type, order_type, price)
             raise
+        except GeminiWSRPCPostSendError:
+            # The request was SENT but its reply was lost. The order may be live on Gemini, so a REST
+            # re-place would risk a duplicate. Reconcile by client_order_id instead (NEW-CRIT-1).
+            self.logger().warning(
+                f"WS order.place reply lost for {order_id}; reconciling via REST order/status.")
+            return await self._reconcile_unknown_placement(order_id, trading_pair)
 
         # The assigned exchange order id is guaranteed on the orders@account NEW event ("i") and may or
         # may not also appear in this synchronous reply — resolve defensively from either source.
         o_id = result.get("order_id")
         if o_id is None:
             o_id = result.get("orderId")
-        # The reply timestamp field name/units are unconfirmed (plan D12): "timestampms" is ms while a
-        # bare "timestamp" is conventionally s/ns. Route through the magnitude-detecting helper rather
-        # than assuming ms, so a seconds/ns reply is not mis-scaled by 1000x.
-        transact = result.get("timestampms")
-        if transact is None:
-            transact = result.get("timestamp")
-        if transact:
-            transact_time = CONSTANTS.convert_timestamp_to_seconds(float(transact))
+        # Reply timestamp is name-based (NEW-CRIT-6): "timestampms" is ms; a bare "timestamp" has an
+        # unconfirmed unit, so accept it only when it lands within ~1 day of the wall clock.
+        if "timestampms" in result:
+            transact_time = float(result["timestampms"]) * 1e-3
+        elif "timestamp" in result:
+            raw = float(result["timestamp"])
+            # bare "timestamp" unit unconfirmed; accept only if within ~1 day of wall clock, else use current
+            transact_time = raw if abs(raw - self.current_timestamp) < 86400 else self.current_timestamp
         else:
             transact_time = self.current_timestamp
 
@@ -232,7 +254,10 @@ class GeminiExchange(ExchangePyBase):
             if tracked_order is not None:
                 o_id = await tracked_order.get_exchange_order_id()
             if o_id is None:
-                raise IOError(f"order.place for {order_id} returned no order id and no NEW event arrived")
+                # Neither the reply nor the orders@account NEW event yielded an id. Before failing,
+                # reconcile by client_order_id — a genuinely-unplaced order surfaces as the IOError
+                # from _reconcile_unknown_placement, which we let propagate.
+                return await self._reconcile_unknown_placement(order_id, trading_pair)
         else:
             o_id = str(o_id)
             if tracked_order is not None and tracked_order.exchange_order_id is None:
@@ -242,6 +267,25 @@ class GeminiExchange(ExchangePyBase):
 
         return o_id, transact_time
 
+    async def _reconcile_unknown_placement(self, order_id: str, trading_pair: str) -> Tuple[str, float]:
+        """Recover the exchange id for an order whose WS placement could not be confirmed.
+
+        Called when ``order.place`` was sent but its reply was lost (``GeminiWSRPCPostSendError``) or
+        when neither the reply nor the orders@account NEW event yielded an id. We query REST
+        ``/v1/order/status`` by ``client_order_id`` (which Gemini accepts as an alternative to
+        ``order_id``): if the order exists we adopt its assigned id and timestamp; if it is not found
+        we raise ``IOError`` so a genuinely-unplaced order still fails loudly rather than being
+        silently treated as live.
+        """
+        resp = await self._api_post(
+            path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
+            data={"request": CONSTANTS.ORDER_STATUS_PATH_URL, "client_order_id": order_id},
+            is_auth_required=True,
+            limit_id=CONSTANTS.ORDER_STATUS_PATH_URL)
+        if resp.get("result") == "error" or "order_id" not in resp:
+            raise IOError(f"Gemini order {order_id} not found after unresolved WS placement: {resp}")
+        return str(resp["order_id"]), resp.get("timestampms", 0) * 1e-3
+
     async def _place_order_rest(self,
                                 order_id: str,
                                 trading_pair: str,
@@ -249,6 +293,10 @@ class GeminiExchange(ExchangePyBase):
                                 trade_type: TradeType,
                                 order_type: OrderType,
                                 price: Decimal) -> Tuple[str, float]:
+        if order_type == OrderType.MARKET:
+            raise IOError(
+                "Gemini REST fallback cannot place MARKET orders; WS order entry is required for "
+                "market orders.")
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         side = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
 
@@ -294,12 +342,14 @@ class GeminiExchange(ExchangePyBase):
                 method=CONSTANTS.WS_METHOD_ORDER_CANCEL,
                 params={"orderId": str(tracked_order.exchange_order_id)},
                 limit_id=CONSTANTS.WS_ORDER_CANCEL_LIMIT_ID)
-        except (IOError, asyncio.TimeoutError):
-            # Transport failure only; cancel is idempotent so the REST fallback is always safe. A
-            # not-found GeminiWSRPCError propagates so the base lost-order handling fires.
+        except (IOError, asyncio.TimeoutError, GeminiWSRPCPostSendError):
+            # Transport failure OR a post-send reply loss. Unlike placement, cancel is idempotent, so
+            # re-issuing over REST is always safe: if the order was already cancelled, REST returns
+            # OrderNotFound which _is_order_not_found_during_cancelation_error maps to success. (A
+            # genuine not-found GeminiWSRPCError still propagates so the base lost-order handling fires.)
             if not CONSTANTS.WS_ORDER_OPS_REQUIRED:
                 self.logger().warning(
-                    f"WS order.cancel transport failure for {order_id}; falling back to REST.")
+                    f"WS order.cancel transport/reply failure for {order_id}; falling back to REST.")
                 return await self._place_cancel_rest(tracked_order)
             raise
 

@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, Optional
 
 from hummingbot.connector.exchange.gemini.gemini_constants import convert_timestamp_to_seconds
@@ -29,10 +30,19 @@ class GeminiOrderBook(OrderBook):
                                    metadata: Optional[Dict] = None) -> OrderBookMessage:
         if metadata:
             msg.update(metadata)
+        # CRIT-14: Gemini's REST snapshot (/v1/book/{symbol}) carries no sequence/lastUpdateId, so
+        # snapshot_message_from_exchange derives its update_id from the wall-clock-ms domain
+        # (int(timestamp * 1e3), ~1.78e12). The exchange's WS depth sequence numbers ("U"/"u") live
+        # in an unrelated, much smaller domain, so the tracker's reject gate
+        # (OrderBook.snapshot_uid > diff.update_id) would drop EVERY diff and the book would only
+        # refresh on the hourly REST resync. We therefore align diffs onto the same wall-clock-ms
+        # domain as the snapshot (the proven OKX pattern), using the diff's arrival timestamp.
+        effective_ts = timestamp if timestamp is not None else time.time()
+        update_id = int(effective_ts * 1e3)
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
-            "first_update_id": msg.get("U", 0),
-            "update_id": msg.get("u", 0),
+            "first_update_id": update_id,
+            "update_id": update_id,
             "bids": msg.get("b", []),
             "asks": msg.get("a", [])
         }, timestamp=timestamp)

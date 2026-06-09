@@ -7,7 +7,7 @@ from bidict import bidict
 
 from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
 from hummingbot.connector.exchange.gemini.gemini_exchange import GeminiExchange
-from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError
+from hummingbot.connector.exchange.gemini.gemini_ws_rpc import GeminiWSRPCError, GeminiWSRPCPostSendError
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
@@ -31,6 +31,7 @@ class GeminiExchangeTests(TestCase):
         order_types = self.exchange.supported_order_types()
         self.assertIn(OrderType.LIMIT, order_types)
         self.assertIn(OrderType.LIMIT_MAKER, order_types)
+        self.assertIn(OrderType.MARKET, order_types)
 
     def test_trading_pairs(self):
         self.assertEqual(["BTC-USD", "ETH-USD"], self.exchange.trading_pairs)
@@ -317,8 +318,8 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(CONSTANTS.WS_METHOD_ORDER_PLACE, send_rpc.call_args.kwargs["method"])
         self.assertEqual(CONSTANTS.WS_ORDER_PLACE_LIMIT_ID, send_rpc.call_args.kwargs["limit_id"])
         params = send_rpc.call_args.kwargs["params"]
-        # Binance-style camelCase/uppercase; no REST-style key leakage.
-        self.assertEqual("BTCUSD", params["symbol"])
+        # Binance-style camelCase; symbol sent LOWERCASE; no REST-style key leakage.
+        self.assertEqual("btcusd", params["symbol"])
         self.assertEqual(CONSTANTS.WS_SIDE_BUY, params["side"])
         self.assertEqual(CONSTANTS.WS_ORDER_TYPE_LIMIT, params["type"])
         self.assertEqual(CONSTANTS.WS_TIF_GTC, params["timeInForce"])
@@ -334,7 +335,7 @@ class GeminiExchangeTests(TestCase):
             order_id="HBOT1", trading_pair="ETH-USD", amount=Decimal("1"),
             trade_type=TradeType.SELL, order_type=OrderType.LIMIT_MAKER, price=Decimal("100")))
         params = send_rpc.call_args.kwargs["params"]
-        self.assertEqual("ETHUSD", params["symbol"])
+        self.assertEqual("ethusd", params["symbol"])
         self.assertEqual(CONSTANTS.WS_SIDE_SELL, params["side"])
         self.assertEqual(CONSTANTS.WS_TIF_MAKER_OR_CANCEL, params["timeInForce"])
 
@@ -368,8 +369,11 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(12345.0, ts)
 
     def test_place_order_raises_when_no_id_and_no_tracked_order(self):
+        # No id from reply, order untracked, and reconciliation by client_order_id also finds nothing
+        # => a genuinely-unplaced order still fails loudly with IOError.
         self._set_symbol_map()
         self._mock_send_rpc(return_value={})  # no id, order is not tracked
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "OrderNotFound"})
         with self.assertRaises(IOError):
             self._async_run(self.exchange._place_order(
                 order_id="UNTRACKED", trading_pair="BTC-USD", amount=Decimal("1"),
@@ -530,6 +534,126 @@ class GeminiExchangeTests(TestCase):
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
         with self.assertRaises(ValueError):
             self._async_run(self.exchange._place_cancel("HBOT1", order))
+
+    # ------------------------------------------------------------------
+    # Market orders + lost-order recovery (NEW-CRIT-1/2/6)
+    # ------------------------------------------------------------------
+
+    def test_place_order_market_sends_market_schema(self):
+        # MARKET: type=MARKET, timeInForce=IOC, NO price key, lowercase symbol, quantity present.
+        self._set_symbol_map()
+        send_rpc = self._mock_send_rpc(
+            return_value={"order_id": 9876, "timestampms": 1700000000000})
+        self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.MARKET, price=Decimal("0")))
+        params = send_rpc.call_args.kwargs["params"]
+        self.assertEqual("btcusd", params["symbol"])
+        self.assertEqual(CONSTANTS.WS_ORDER_TYPE_MARKET, params["type"])
+        self.assertEqual(CONSTANTS.WS_TIF_IOC, params["timeInForce"])
+        self.assertEqual("1", params["quantity"])
+        self.assertEqual("HBOT1", params["clientOrderId"])
+        self.assertNotIn("price", params)
+
+    def test_place_order_rest_raises_for_market(self):
+        # Gemini REST cannot place market orders; the fallback path must reject loudly.
+        self._set_symbol_map()
+        self.exchange._api_post = AsyncMock()
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._place_order_rest(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.MARKET, price=Decimal("0")))
+        self.exchange._api_post.assert_not_called()
+
+    def test_place_order_post_send_error_reconciles_without_rest_replace(self):
+        # NEW-CRIT-1: a lost reply (request was SENT) must NOT re-place over REST; it reconciles
+        # by client_order_id instead so the (possibly live) order is not duplicated.
+        self._set_symbol_map()
+        self._mock_send_rpc(side_effect=GeminiWSRPCPostSendError("reply lost"))
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("REST _place_order_rest must not be called on a post-send error")
+
+        self.exchange._place_order_rest = AsyncMock(side_effect=_fail_if_called)
+        self.exchange._reconcile_unknown_placement = AsyncMock(return_value=("9876", 1700000000.0))
+        o_id, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("9876", o_id)
+        self.assertEqual(1700000000.0, ts)
+        self.exchange._reconcile_unknown_placement.assert_awaited_once_with("HBOT1", "BTC-USD")
+        self.exchange._place_order_rest.assert_not_called()
+
+    def test_reconcile_unknown_placement_found(self):
+        self._set_symbol_map()
+        self.exchange._api_post = AsyncMock(
+            return_value={"order_id": 9876, "timestampms": 1700000000000})
+        o_id, ts = self._async_run(
+            self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual("9876", o_id)
+        self.assertEqual(1700000000.0, ts)
+        # Queried REST order/status by client_order_id.
+        _, kwargs = self.exchange._api_post.call_args
+        self.assertEqual("HBOT1", kwargs["data"]["client_order_id"])
+        self.assertEqual(CONSTANTS.ORDER_STATUS_PATH_URL, kwargs["data"]["request"])
+
+    def test_reconcile_unknown_placement_error_raises(self):
+        self._set_symbol_map()
+        self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "boom"})
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+
+    def test_reconcile_unknown_placement_not_found_raises(self):
+        self._set_symbol_map()
+        self.exchange._api_post = AsyncMock(return_value={"is_live": True})  # no order_id
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+
+    def test_place_order_no_id_reconciles(self):
+        # When neither reply nor NEW event yields an id, _place_order falls back to reconciliation.
+        self._set_symbol_map()
+        self._mock_send_rpc(return_value={})  # no id, order not tracked
+        self.exchange._reconcile_unknown_placement = AsyncMock(return_value=("777", 12.0))
+        o_id, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual("777", o_id)
+        self.assertEqual(12.0, ts)
+        self.exchange._reconcile_unknown_placement.assert_awaited_once()
+
+    def test_place_order_timestampms_is_name_based_no_heuristic(self):
+        # NEW-CRIT-6: timestampms reply -> transact_time == timestampms * 1e-3 (no magnitude guess).
+        self._set_symbol_map()
+        self._mock_send_rpc(return_value={"order_id": 1, "timestampms": 1700000000000})
+        _, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual(1700000000.0, ts)
+
+    def test_place_order_bare_timestamp_wildly_off_uses_current(self):
+        # NEW-CRIT-6: a bare "timestamp" far from the wall clock is distrusted -> current_timestamp.
+        self._set_symbol_map()
+        self.exchange._set_current_timestamp(1700000000.0)
+        self._mock_send_rpc(return_value={"order_id": 1, "timestamp": 1})  # ~1.7e9 off
+        _, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual(1700000000.0, ts)
+
+    def test_user_stream_rpc_requires_send_rpc(self):
+        # NEW-CONC-3: a data source lacking send_rpc is a contract violation -> RuntimeError.
+        class _DummyDataSource:
+            pass
+
+        self.exchange._user_stream_tracker._data_source = _DummyDataSource()
+        with self.assertRaises(RuntimeError):
+            _ = self.exchange._user_stream_rpc
+
+    def test_order_not_found_predicate_typed(self):
+        # NEW-CONC-7: a GeminiWSRPCError tagged not-found satisfies the predicate via the typed check.
+        err = GeminiWSRPCError(code=-2010, status=400, message="gone")
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(err))
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(err))
 
     # ------------------------------------------------------------------
     # Trading rules
@@ -736,14 +860,27 @@ class GeminiExchangeTests(TestCase):
             self._drive_user_stream([balance_event])
         self.assertTrue(warn.called)
 
-    def test_user_stream_handles_unexpected_error(self):
-        # A malformed order event (status present but bad data) should be caught and logged.
-        # The listener no longer sleeps on error; it just continues draining the queue (CRIT-1).
+    def test_user_stream_survives_malformed_event_and_processes_next(self):
+        # NEW-CRIT-4: resilience contract (not "silently drop everything"). A malformed fill event
+        # (bad "Z") must (a) fire the malformed-event error log, (b) NOT record a fill, and (c) NOT
+        # kill the listener — a SECOND, well-formed event delivered after it is still processed.
+        # REST status/trade polling is the reconciliation path for the dropped event.
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123", amount="1")
         bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
-        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")  # noqa: F841
-        self._drive_user_stream([bad_event])
-        # No fills recorded because the Decimal conversion failed and was handled
-        self.assertEqual(0, len(self.exchange.in_flight_orders["HBOT1"].order_fills))
+        good_event = self._make_fill_event(
+            client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            status="PARTIALLY_FILLED", cumulative_z="0.4", last_price="100", trade_id="trade-good")
+
+        with patch.object(self.exchange.logger(), "error") as err:
+            self._drive_user_stream([bad_event, good_event])
+
+        # (a) the malformed-event error log fired for the bad event
+        self.assertTrue(err.called)
+        # (b)+(c) the bad event recorded no fill, the good event that followed was processed
+        self.assertEqual(1, len(order.order_fills))
+        self.assertIn("trade-good", order.order_fills)
+        self.assertEqual(Decimal("0.4"), order.order_fills["trade-good"].fill_base_amount)
+        self.assertEqual(Decimal("0.4"), order.executed_amount_base)
 
     def test_user_stream_listener_does_not_sleep_on_error(self):
         # CRIT-1: a malformed event must not stall the queue with a 5s sleep.

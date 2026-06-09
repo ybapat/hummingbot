@@ -21,6 +21,10 @@ class GeminiOrderBookTests(TestCase):
         self.assertEqual(2, len(snapshot.content["asks"]))
 
     def test_diff_message_from_exchange(self):
+        # CRIT-14: the diff's update_id must live in the same wall-clock-ms domain as the snapshot
+        # (int(timestamp * 1e3)), NOT the exchange's "u"/"U" depth sequence numbers, otherwise the
+        # tracker's snapshot_uid gate would reject every diff.
+        timestamp = 1234567890.0
         msg = {
             "e": "depthUpdate",
             "E": 1234567890000,
@@ -31,12 +35,27 @@ class GeminiOrderBookTests(TestCase):
             "a": [["50001.00", "0"]],
         }
         diff = GeminiOrderBook.diff_message_from_exchange(
-            msg, timestamp=1234567890.0, metadata={"trading_pair": "BTC-USD"}
+            msg, timestamp=timestamp, metadata={"trading_pair": "BTC-USD"}
         )
         self.assertEqual(OrderBookMessageType.DIFF, diff.type)
         self.assertEqual("BTC-USD", diff.content["trading_pair"])
-        self.assertEqual(100, diff.content["first_update_id"])
-        self.assertEqual(200, diff.content["update_id"])
+        # update_id is the wall-clock-ms timestamp, not the exchange "u" sequence number.
+        self.assertEqual(int(timestamp * 1e3), diff.content["update_id"])
+        # first_update_id is kept in the same domain as update_id (not the exchange "U").
+        self.assertEqual(int(timestamp * 1e3), diff.content["first_update_id"])
+
+        # The diff update_id is in the SAME domain as a snapshot built from the same timestamp.
+        snapshot = GeminiOrderBook.snapshot_message_from_exchange(
+            {"bids": [], "asks": []}, timestamp=timestamp, metadata={"trading_pair": "BTC-USD"}
+        )
+        self.assertEqual(snapshot.content["update_id"], diff.content["update_id"])
+
+        # A diff that arrives AFTER a snapshot (larger wall-clock timestamp) has a LARGER update_id,
+        # so the tracker's `snapshot_uid > diff.update_id` reject gate would NOT drop it.
+        later_diff = GeminiOrderBook.diff_message_from_exchange(
+            dict(msg), timestamp=timestamp + 1.0, metadata={"trading_pair": "BTC-USD"}
+        )
+        self.assertGreater(later_diff.content["update_id"], snapshot.content["update_id"])
 
     def test_trade_message_from_exchange(self):
         msg = {

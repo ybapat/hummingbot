@@ -64,7 +64,9 @@ WS_CANCEL_ON_DISCONNECT = False   # MUST stay False on the shared socket (mass-c
 WS_SIDE_BUY = "BUY"
 WS_SIDE_SELL = "SELL"
 WS_ORDER_TYPE_LIMIT = "LIMIT"
+WS_ORDER_TYPE_MARKET = "MARKET"
 WS_TIF_GTC = "GTC"
+WS_TIF_IOC = "IOC"                # market-order TIF (sandbox-confirm FOK alternative)
 WS_TIF_MAKER_OR_CANCEL = "MOC"    # OPEN (D7): confirm post-only/maker-or-cancel encoding against sandbox
 
 # WS RPC error codes
@@ -76,10 +78,10 @@ WS_ERR_UNSUPPORTED = -1020        # 400
 WS_ERR_ORDER_REJECT = -2010       # 400
 WS_ORDER_NOT_FOUND_CODES = {-2010}   # OPEN (D8): verify exact not-found code/msg against sandbox
 
-# Dedicated WS throttle ids (separate bucket from REST ORDERS_RATE; avoids fallback double-count)
+# WS throttle ids. These link to the shared account-wide ORDERS_RATE bucket (see RATE_LIMITS) so
+# WS and REST order mutations cannot collectively exceed Gemini's order limit.
 WS_ORDER_PLACE_LIMIT_ID = "WS_ORDER_PLACE"
 WS_ORDER_CANCEL_LIMIT_ID = "WS_ORDER_CANCEL"
-WS_ORDER_RATE = "WS_ORDER_RATE"
 
 # Time
 WS_HEARTBEAT_TIME_INTERVAL = 30
@@ -166,11 +168,12 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=BALANCES_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
-    # WS order-entry limits: separate bucket from REST ORDERS_RATE so a WS->REST fallback
-    # does not double-charge the same limit.
-    RateLimit(limit_id=WS_ORDER_RATE, limit=100, time_interval=ONE_MINUTE),
+    # WS order-entry limits share the account-wide ORDERS_RATE bucket (the same 100/min order
+    # bucket NEW_ORDER_PATH_URL/CANCEL_ORDER_PATH_URL link to) so WS and REST order mutations
+    # together cannot exceed Gemini's order limit (sandbox-confirm the limit is account-wide, not
+    # per-transport).
     RateLimit(limit_id=WS_ORDER_PLACE_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(WS_ORDER_RATE, 1)]),
+              linked_limits=[LinkedLimitWeightPair(ORDERS_RATE, 1)]),
     RateLimit(limit_id=WS_ORDER_CANCEL_LIMIT_ID, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(WS_ORDER_RATE, 1)]),
+              linked_limits=[LinkedLimitWeightPair(ORDERS_RATE, 1)]),
 ]
