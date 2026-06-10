@@ -296,6 +296,14 @@ class GeminiExchangeTests(TestCase):
         self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(not_found))
         self.assertFalse(self.exchange._is_order_not_found_during_cancelation_error(other))
 
+    def test_invalid_order_id_treated_as_not_found(self):
+        # CONCERN: "InvalidOrderId" (Gemini's stale/unknown-id error) must be recognized by the
+        # lost-order GC predicates, not only "OrderNotFound" — else a stale id is never garbage-
+        # collected. The INVALID_ORDER_ERROR constant was defined but previously unwired.
+        exc = Exception(f"Gemini error: {CONSTANTS.INVALID_ORDER_ERROR}")
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(exc))
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(exc))
+
     def test_update_trading_fees_is_noop(self):
         self.assertIsNone(self._async_run(self.exchange._update_trading_fees()))
 
@@ -730,6 +738,18 @@ class GeminiExchangeTests(TestCase):
             self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
         self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
 
+    def test_reconcile_unknown_placement_ignores_stranger_row(self):
+        # CONCERN (4-reviewer): the list may contain ONLY other orders. We must NOT fall back to
+        # resp[0] and adopt a stranger's exchange id as ours — a no-match is treated as not-found.
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"order_id": 111, "client_order_id": "SOMEONE_ELSE", "timestampms": 1700000000000},
+        ])
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
+
     def test_place_order_no_id_event_timeout_reconciles(self):
         # No id in the reply AND the orders@account NEW event never arrives within the timeout:
         # get_exchange_order_id() raising TimeoutError must route to _reconcile_unknown_placement
@@ -1011,6 +1031,30 @@ class GeminiExchangeTests(TestCase):
                 self.assertEqual(1, len(order.order_fills))
                 self.assertIn("TID1", order.order_fills)
                 self.assertEqual(Decimal("1"), order.executed_amount_base)
+
+    def test_rest_fill_skipped_when_already_fully_executed_with_unseen_tid(self):
+        # CRIT-1/D10 guard: if Gemini issues a DIFFERENT trade id across surfaces (WS "t" vs REST
+        # "tid") for the same execution, re-adding the REST copy would double-count. Here the WS path
+        # fully fills the order under "T-WS"; a REST mytrades entry then arrives under a different
+        # "T-REST". Because the order is already fully executed and "T-REST" is unseen, it is skipped
+        # (a fill beyond the order's own size is never legitimate) rather than inflating the position.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(
+            order_id="HBOT1", exchange_order_id="100234", amount="1")
+        ws_event = self._make_fill_event(
+            client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            status="FILLED", cumulative_z="1", last_price="100", trade_id="T-WS")
+        self._drive_user_stream([ws_event])
+        self.assertEqual(Decimal("1"), order.executed_amount_base)  # fully executed via WS
+
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"tid": "T-REST", "order_id": 100234, "amount": "1", "price": "100",
+             "fee_amount": "0.1", "fee_currency": "USD", "timestampms": 1700000000000},
+        ])
+        with patch.object(self.exchange.logger(), "warning") as warn:
+            updates = self._async_run(self.exchange._all_trade_updates_for_order(order))
+        self.assertEqual([], updates)  # the unseen-tid duplicate is dropped, not double-counted
+        self.assertTrue(warn.called)
 
     # ------------------------------------------------------------------
     # Balances

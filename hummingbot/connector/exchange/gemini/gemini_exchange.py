@@ -132,14 +132,18 @@ class GeminiExchange(ExchangePyBase):
         await super()._update_time_synchronizer(pass_on_non_cancelled_error=pass_on_non_cancelled_error)
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        error_str = str(status_update_exception)
         return (isinstance(status_update_exception, GeminiWSRPCError)
                 and status_update_exception.is_order_not_found()) \
-            or CONSTANTS.ORDER_NOT_FOUND_ERROR in str(status_update_exception)
+            or CONSTANTS.ORDER_NOT_FOUND_ERROR in error_str \
+            or CONSTANTS.INVALID_ORDER_ERROR in error_str
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        error_str = str(cancelation_exception)
         return (isinstance(cancelation_exception, GeminiWSRPCError)
                 and cancelation_exception.is_order_not_found()) \
-            or CONSTANTS.ORDER_NOT_FOUND_ERROR in str(cancelation_exception)
+            or CONSTANTS.ORDER_NOT_FOUND_ERROR in error_str \
+            or CONSTANTS.INVALID_ORDER_ERROR in error_str
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -313,17 +317,16 @@ class GeminiExchange(ExchangePyBase):
                 # live, so we give read-after-write lag another chance before giving up.
                 last_detail = e
             else:
-                # The status-by-client_order_id surface returns a LIST. Pick the row whose
-                # client_order_id matches (fall back to the first row); an empty list is not-found.
+                # The status-by-client_order_id surface returns a LIST. Adopt ONLY a row whose
+                # client_order_id EXACTLY matches ours — never fall back to resp[0], which may be a
+                # different (stranger's) order and would make us claim its exchange id as our own.
                 if isinstance(resp, list):
-                    if not resp:
-                        last_detail = resp
-                        resp = None
-                    else:
-                        resp = next(
-                            (row for row in resp
-                             if isinstance(row, dict) and row.get("client_order_id") == order_id),
-                            resp[0])
+                    resp = next(
+                        (row for row in resp
+                         if isinstance(row, dict) and row.get("client_order_id") == order_id),
+                        None)
+                    if resp is None:
+                        last_detail = f"no order/status row matched client_order_id={order_id}"
                 if isinstance(resp, dict) and resp.get("result") != "error":
                     # A row may carry the assigned id under "order_id" or "id".
                     o_id = resp.get("order_id", resp.get("id"))
@@ -331,7 +334,8 @@ class GeminiExchange(ExchangePyBase):
                         transact_ms = resp.get("timestampms")
                         transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
                         return str(o_id), transact_time
-                last_detail = resp
+                if resp is not None:
+                    last_detail = resp
 
             if attempt < CONSTANTS.RECONCILE_MAX_ATTEMPTS:
                 self.logger().warning(
@@ -640,6 +644,22 @@ class GeminiExchange(ExchangePyBase):
 
                 for trade in all_fills_response:
                     if str(trade.get("order_id", "")) == order.exchange_order_id:
+                        tid = str(trade["tid"])
+                        # CRIT-1 / D10 guard against WS<->REST fill double-count. The WS user stream
+                        # records fills keyed on the executionReport "t" trade id; this REST path keys
+                        # on mytrades "tid". If Gemini ever issues a DIFFERENT value for the same
+                        # execution across the two surfaces (unverified — needs a forced-multi-fill
+                        # canary), re-adding this trade would over-report the position. A fill that
+                        # would push an already-fully-executed order beyond its own size is never
+                        # legitimate, so skip it and warn loudly. When t == tid (the Binance-mirror
+                        # expectation), `tid` is already in order_fills and this guard is a no-op.
+                        if tid not in order.order_fills and order.executed_amount_base >= order.amount:
+                            self.logger().warning(
+                                f"Skipping REST fill tid={tid} for {order.client_order_id}: order "
+                                f"already fully executed ({order.executed_amount_base}/{order.amount}) "
+                                f"and this tid is unseen — likely WS 't' vs REST 'tid' mismatch; "
+                                f"verify D10 with a forced multi-fill canary.")
+                            continue
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=order.trade_type,
