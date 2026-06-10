@@ -57,8 +57,16 @@ ORDER_TYPE_LIMIT = "exchange limit"
 # WS order-entry RPC settings
 WS_RPC_TIMEOUT = 8.0              # < InFlightOrder.GET_EX_ORDER_ID_TIMEOUT (10s)
 WS_RPC_READY_TIMEOUT = 5.0        # bound on waiting for the reader to start draining
-WS_ORDER_OPS_REQUIRED = False     # False => transport-failure REST fallback allowed
+WS_ORDER_OPS_REQUIRED = True      # WS order entry is mandatory — a transport failure raises rather
+#                                   than silently falling back to a different (REST) code path;
+#                                   genuine exchange rejects already propagate regardless.
 WS_CANCEL_ON_DISCONNECT = False   # MUST stay False on the shared socket (mass-cancel footgun); wiring NOT shipped
+
+# Reconciliation retry settings for a SENT-but-unconfirmed WS placement. The order may already be
+# LIVE on Gemini, so a single immediate REST order/status query can hit read-after-write lag and
+# wrongly mark a live order FAILED; retry with a short backoff before giving up.
+RECONCILE_MAX_ATTEMPTS = 3
+RECONCILE_BACKOFF_SECONDS = 0.5
 
 # Fast API order.place / order.cancel wire schema (Binance-style; D7/D8)
 WS_SIDE_BUY = "BUY"

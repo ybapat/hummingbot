@@ -283,17 +283,44 @@ class GeminiExchange(ExchangePyBase):
         ``order_id``): if the order exists we adopt its assigned id and timestamp; if it is not found
         we raise ``IOError`` so a genuinely-unplaced order still fails loudly rather than being
         silently treated as live.
+
+        Because this is the recovery path for a SENT-but-unconfirmed order (the order may be LIVE on
+        Gemini), a single immediate query can race read-after-write lag and wrongly conclude the order
+        does not exist. So we retry up to ``RECONCILE_MAX_ATTEMPTS`` with a short backoff, treating both
+        a definitive not-found AND a transient REST error as retryable; only after the last attempt do
+        we raise (NEW-CRIT-E).
         """
-        resp = await self._api_post(
-            path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
-            data={"request": CONSTANTS.ORDER_STATUS_PATH_URL, "client_order_id": order_id},
-            is_auth_required=True,
-            limit_id=CONSTANTS.ORDER_STATUS_PATH_URL)
-        if resp.get("result") == "error" or "order_id" not in resp:
-            raise IOError(f"Gemini order {order_id} not found after unresolved WS placement: {resp}")
-        transact_ms = resp.get("timestampms")
-        transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
-        return str(resp["order_id"]), transact_time
+        last_detail: Any = None
+        for attempt in range(1, CONSTANTS.RECONCILE_MAX_ATTEMPTS + 1):
+            try:
+                resp = await self._api_post(
+                    path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
+                    data={"request": CONSTANTS.ORDER_STATUS_PATH_URL, "client_order_id": order_id},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.ORDER_STATUS_PATH_URL)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # A transient REST error is retried (not immediately fatal): the order may still be
+                # live, so we give read-after-write lag another chance before giving up.
+                last_detail = e
+            else:
+                if resp.get("result") != "error" and "order_id" in resp:
+                    transact_ms = resp.get("timestampms")
+                    transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
+                    return str(resp["order_id"]), transact_time
+                last_detail = resp
+
+            if attempt < CONSTANTS.RECONCILE_MAX_ATTEMPTS:
+                self.logger().warning(
+                    f"Gemini order {order_id} not yet resolvable via REST order/status "
+                    f"(attempt {attempt}/{CONSTANTS.RECONCILE_MAX_ATTEMPTS}, detail={last_detail}); "
+                    f"retrying after {CONSTANTS.RECONCILE_BACKOFF_SECONDS}s.")
+                await self._sleep(CONSTANTS.RECONCILE_BACKOFF_SECONDS)
+
+        raise IOError(
+            f"Gemini order {order_id} not found after unresolved WS placement "
+            f"({CONSTANTS.RECONCILE_MAX_ATTEMPTS} attempts): {last_detail}")
 
     async def _place_order_rest(self,
                                 order_id: str,
@@ -464,12 +491,14 @@ class GeminiExchange(ExchangePyBase):
                     client_order_id = event_message.get("c", "")
 
                     # When a fill occurs, extract fill details from WS event fields.
-                    # Per Gemini Fast API docs:
-                    #   Z = CUMULATIVE executed base quantity for the order
+                    # This is a Binance-style executionReport, so the cumulative fields are:
+                    #   z = CUMULATIVE FILLED BASE quantity for the order (what we delta against
+                    #       executed_amount_base — NOT uppercase "Z")
+                    #   Z = CUMULATIVE QUOTE spent (Σ price×qty) — not used here
                     #   L = price of the most recent execution (last fill price)
                     #   t = trade ID for the most recent execution
                     # Because `update_with_trade_update` accumulates `fill_base_amount`,
-                    # we must convert the cumulative `Z` into a per-fill delta by
+                    # we must convert the cumulative base `z` into a per-fill delta by
                     # subtracting what we've already tracked for this order. We also
                     # require a stable `t` to safely dedupe duplicate/stale events.
                     if order_status in ("PARTIALLY_FILLED", "FILLED"):
@@ -485,9 +514,9 @@ class GeminiExchange(ExchangePyBase):
                                 f"{order_status}); skipping — REST polling will reconcile.")
                             continue
                         if tracked_order is not None and trade_id_raw not in (None, ""):
-                            cumulative_z = Decimal(str(event_message.get("Z", "0")))
+                            cumulative_base = Decimal(str(event_message.get("z", "0")))
                             prior_filled = tracked_order.executed_amount_base
-                            fill_amount = max(Decimal("0"), cumulative_z - prior_filled)
+                            fill_amount = max(Decimal("0"), cumulative_base - prior_filled)
                             if fill_amount > Decimal("0"):
                                 fill_price = Decimal(str(event_message["L"]))
                                 # CONC-6: reject a non-finite or non-positive fill price.
@@ -644,10 +673,15 @@ class GeminiExchange(ExchangePyBase):
             new_state = OrderState.OPEN
         elif Decimal(str(remaining_amount)) == Decimal("0") and Decimal(str(executed_amount)) > Decimal("0"):
             new_state = OrderState.FILLED
+        elif Decimal(str(executed_amount)) > Decimal("0"):
+            # Not live, not cancelled, remaining > 0 but already partially executed => the order was
+            # terminated AFTER a partial fill. Its fills are real, so CANCELED is the correct terminal
+            # label (FAILED would wrongly imply nothing happened); we reserve FAILED for executed == 0.
+            new_state = OrderState.CANCELED
         else:
-            # Not live, not cancelled, and nothing left to fill (or nothing filled) => the order
-            # terminated without completing. We treat this as FAILED (rejected/expired). Pending
-            # Gemini sandbox confirmation that this branch never masks a genuine FILLED (Q-3).
+            # Not live, not cancelled, and nothing filled => the order terminated without completing.
+            # We treat this as FAILED (rejected/expired). Pending Gemini sandbox confirmation that this
+            # branch never masks a genuine FILLED (Q-3).
             new_state = OrderState.FAILED
 
         order_update = OrderUpdate(

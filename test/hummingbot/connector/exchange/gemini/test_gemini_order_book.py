@@ -96,3 +96,23 @@ class GeminiOrderBookTests(TestCase):
         self.assertEqual("BTC-USD", trade.content["trading_pair"])
         self.assertEqual(67890, trade.content["trade_id"])
         self.assertEqual(float(TradeType.BUY.value), trade.content["trade_type"])
+
+    def test_trade_message_from_exchange_missing_event_time_uses_wall_clock(self):
+        # CONC-3: a trade without an "E" event time must fall back to wall-clock instead of stamping
+        # the 1970 epoch (convert_timestamp_to_seconds(0) == 0). The update_id must also be non-zero.
+        msg = {
+            "e": "trade",
+            "s": "BTCUSD",
+            "t": 99999,
+            "p": "50000.00",
+            "q": "0.5",
+            "m": False,
+        }
+        trade = GeminiOrderBook.trade_message_from_exchange(
+            msg, metadata={"trading_pair": "BTC-USD"}
+        )
+        self.assertEqual(OrderBookMessageType.TRADE, trade.type)
+        # Recent (post-2001) wall-clock seconds, not the 1970 epoch.
+        self.assertGreater(trade.timestamp, 1e9)
+        # update_id derived from wall-clock ms, never 0.
+        self.assertGreater(trade.content["update_id"], 0)

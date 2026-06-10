@@ -150,11 +150,16 @@ class GeminiAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     async with self._send_lock:
                         try:
                             await ws.send(request)
+                            # Flip inside the lock, the instant the bytes leave: from here a lost reply
+                            # is a POST-send loss (possibly accepted), never a safe pre-send retry.
+                            # Setting it here (not after the context managers unwind) keeps correctness
+                            # independent of whether a throttler/lock __aexit__ ever gains a suspension
+                            # point (MIN-1 hardening).
+                            sent = True
                         except (ConnectionError, RuntimeError) as e:
                             # ws_connection raises RuntimeError("WS is not connected.") on a torn-down
                             # socket; normalize so the caller's pre-send IOError fallback fires.
                             raise IOError(str(e)) from e
-                sent = True
                 return await future
             try:
                 response = await asyncio.wait_for(_send_and_wait(), timeout)

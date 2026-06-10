@@ -226,6 +226,30 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         await self.data_source._parse_order_book_diff_message({"result": None, "id": 2}, queue)
         self.assertEqual(0, queue.qsize())
 
+    async def test_parse_order_book_diff_message_skips_empty_both_sides(self):
+        # NEW-CRIT-D: a depthUpdate with both bids and asks empty/absent must be skipped (not
+        # enqueued) and logged at ERROR, since silently applying it would blank/freeze the book.
+        queue = asyncio.Queue()
+        diff = self._diff_event()
+        diff["b"] = []
+        diff["a"] = []
+        await self.data_source._parse_order_book_diff_message(diff, queue)
+        self.assertEqual(0, queue.qsize())
+        self.assertTrue(any(
+            record.levelname == "ERROR"
+            and "Gemini depthUpdate has no bids or asks" in record.getMessage()
+            for record in self.log_records))
+
+    async def test_parse_order_book_diff_message_processes_one_sided(self):
+        # NEW-CRIT-D: a one-sided update (only bids, asks empty) is legitimate and must still enqueue.
+        queue = asyncio.Queue()
+        diff = self._diff_event()
+        diff["b"] = [["9", "1"]]
+        diff["a"] = []
+        await self.data_source._parse_order_book_diff_message(diff, queue)
+        msg: OrderBookMessage = queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.content["trading_pair"])
+
     async def test_parse_order_book_diff_message_processes_depth_with_id(self):
         # CRIT-7: before the parentheses fix, a real depthUpdate that also carried an "id" field
         # was wrongly skipped because `"id" in msg and "e" not in msg` bound tighter than the `or`.

@@ -135,6 +135,15 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if "result" in raw_message or ("id" in raw_message and "e" not in raw_message):
             return
         if raw_message.get("e") == CONSTANTS.WS_EVENT_DEPTH_UPDATE:
+            # NEW-CRIT-D: diff_message_from_exchange reads Binance-style "b"/"a" fields. If Gemini's
+            # real @depth schema uses different field names, both would resolve empty and we'd silently
+            # apply an empty diff, blanking/freezing the book with no signal. Only bail when BOTH sides
+            # are empty/absent — a one-sided update (only bids OR only asks) is legitimate.
+            if not raw_message.get("b") and not raw_message.get("a"):
+                self.logger().error(
+                    f"Gemini depthUpdate has no bids or asks — possible schema/field-name drift: "
+                    f"keys={list(raw_message)}")
+                return
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=raw_message["s"])
             order_book_message: OrderBookMessage = GeminiOrderBook.diff_message_from_exchange(

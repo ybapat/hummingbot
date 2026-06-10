@@ -51,12 +51,16 @@ class GeminiOrderBook(OrderBook):
     def trade_message_from_exchange(cls, msg: Dict[str, Any], metadata: Optional[Dict] = None):
         if metadata:
             msg.update(metadata)
-        ts = msg.get("E", 0)
+        # CONC-3: a missing event time ("E") must NOT degrade to convert_timestamp_to_seconds(0) == 0,
+        # which would stamp the trade at the 1970 epoch. Fall back to wall-clock time instead, and
+        # derive a non-zero update_id from it so the trade never carries a zero/epoch id.
+        raw_e = msg.get("E")
+        ts_seconds = convert_timestamp_to_seconds(raw_e) if raw_e else time.time()
         return OrderBookMessage(OrderBookMessageType.TRADE, {
             "trading_pair": msg["trading_pair"],
             "trade_type": float(TradeType.SELL.value) if msg.get("m", False) else float(TradeType.BUY.value),
             "trade_id": msg.get("t", 0),
-            "update_id": ts,
+            "update_id": raw_e if raw_e else int(ts_seconds * 1e3),
             "price": msg.get("p", "0"),
             "amount": msg.get("q", "0")
-        }, timestamp=convert_timestamp_to_seconds(ts))
+        }, timestamp=ts_seconds)

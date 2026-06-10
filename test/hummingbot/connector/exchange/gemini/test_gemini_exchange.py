@@ -115,6 +115,10 @@ class GeminiExchangeTests(TestCase):
     def _make_fill_event(client_order_id, exchange_order_id, status,
                          cumulative_z, last_price, trade_id,
                          event_ts_ns=1_700_000_000_000_000_000):
+        # `cumulative_z` is the cumulative FILLED BASE qty. In a Binance-style executionReport that is
+        # lowercase "z"; uppercase "Z" is the cumulative QUOTE (Σ price×qty). Set them to genuinely
+        # DIFFERENT values (base vs base×price) so a test that reads the wrong field yields wrong deltas
+        # whenever price != 1 — this keeps the fill tests discriminating.
         return {
             "e": "executionReport",
             "E": event_ts_ns,
@@ -127,7 +131,7 @@ class GeminiExchangeTests(TestCase):
             "p": "100",
             "q": "1",
             "z": str(cumulative_z),
-            "Z": str(cumulative_z),
+            "Z": str(Decimal(str(cumulative_z)) * Decimal(str(last_price))),
             "L": str(last_price),
             "t": trade_id,
             "T": event_ts_ns,
@@ -178,6 +182,44 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(Decimal("100"), first_fill.fill_price)
         self.assertEqual(Decimal("0.7"), second_fill.fill_base_amount)
         self.assertEqual(Decimal("101"), second_fill.fill_price)
+
+    def test_user_stream_fill_reads_cumulative_base_not_quote(self):
+        # NEW-CRIT-A: the fill delta must come from the cumulative BASE field ("z"), NOT the
+        # cumulative QUOTE field ("Z" = Σ price×qty). With price=100/101 the two fields diverge
+        # wildly, so reading the wrong one would yield deltas of 30/71 instead of 0.3/0.7.
+        order = self._start_tracking_limit_buy(amount="1")
+
+        partial = self._make_fill_event(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            status="PARTIALLY_FILLED",
+            cumulative_z="0.3",   # base; Z becomes 30
+            last_price="100",
+            trade_id="trade-1",
+        )
+        full = self._make_fill_event(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            status="FILLED",
+            cumulative_z="1.0",   # base; Z becomes 101 at price 101
+            last_price="101",
+            trade_id="trade-2",
+        )
+        # Sanity: z and Z genuinely differ so the test discriminates between them.
+        self.assertNotEqual(partial["z"], partial["Z"])
+        self.assertNotEqual(full["z"], full["Z"])
+
+        self._drive_user_stream([partial, full])
+
+        first_fill = order.order_fills["trade-1"]
+        second_fill = order.order_fills["trade-2"]
+        # Base deltas come from "z" (0.3 then 0.7), NOT from "Z" (30 then 71).
+        self.assertEqual(Decimal("0.3"), first_fill.fill_base_amount)
+        self.assertEqual(Decimal("0.7"), second_fill.fill_base_amount)
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+        # fill_quote_amount = base_delta * last fill price.
+        self.assertEqual(Decimal("0.3") * Decimal("100"), first_fill.fill_quote_amount)
+        self.assertEqual(Decimal("0.7") * Decimal("101"), second_fill.fill_quote_amount)
 
     def test_user_stream_duplicate_fill_event_ignored(self):
         order = self._start_tracking_limit_buy(amount="1")
@@ -384,6 +426,7 @@ class GeminiExchangeTests(TestCase):
         # No id from reply, order untracked, and reconciliation by client_order_id also finds nothing
         # => a genuinely-unplaced order still fails loudly with IOError.
         self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()  # reconcile retries with backoff; don't actually sleep
         self._mock_send_rpc(return_value={})  # no id, order is not tracked
         self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "OrderNotFound"})
         with self.assertRaises(IOError):
@@ -407,9 +450,12 @@ class GeminiExchangeTests(TestCase):
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(
             return_value={"order_id": 9876, "timestampms": 1700000000000})
-        o_id, ts = self._async_run(self.exchange._place_order(
-            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        # WS_ORDER_OPS_REQUIRED defaults to True; this test exercises the (dormant) REST-fallback
+        # path, so opt into it explicitly rather than depending on the module default.
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            o_id, ts = self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
         self.assertEqual("9876", o_id)
         self.exchange._api_post.assert_awaited_once()
         # REST builder uses the lower-case REST schema.
@@ -454,7 +500,9 @@ class GeminiExchangeTests(TestCase):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
-        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+        # Opt into the REST-fallback path (default WS_ORDER_OPS_REQUIRED is now True).
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
         self.exchange._api_post.assert_awaited_once()
 
     def test_place_cancel_not_found_propagates_and_matches_predicate(self):
@@ -482,13 +530,14 @@ class GeminiExchangeTests(TestCase):
         rest.assert_not_called()
 
     def test_place_order_rest_fallback_adds_maker_option(self):
-        # Exercises the REST fallback builder's LIMIT_MAKER branch.
+        # Exercises the REST fallback builder's LIMIT_MAKER branch (opt into the dormant fallback).
         self._set_symbol_map()
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"order_id": 1, "timestampms": 0})
-        self._async_run(self.exchange._place_order(
-            order_id="HBOT1", trading_pair="ETH-USD", amount=Decimal("1"),
-            trade_type=TradeType.SELL, order_type=OrderType.LIMIT_MAKER, price=Decimal("100")))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="ETH-USD", amount=Decimal("1"),
+                trade_type=TradeType.SELL, order_type=OrderType.LIMIT_MAKER, price=Decimal("100")))
         _, kwargs = self.exchange._api_post.call_args
         self.assertEqual(CONSTANTS.SIDE_SELL, kwargs["data"]["side"])
         self.assertEqual(["maker-or-cancel"], kwargs["data"]["options"])
@@ -498,34 +547,38 @@ class GeminiExchangeTests(TestCase):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": False})
-        self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
 
     def test_place_order_rest_error_result_raises(self):
-        # Reached via the WS transport-failure REST fallback (CRIT-4).
+        # Reached via the WS transport-failure REST fallback (CRIT-4); opt into the dormant fallback.
         self._set_symbol_map()
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "InvalidPrice"})
-        with self.assertRaises(IOError):
-            self._async_run(self.exchange._place_order(
-                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            with self.assertRaises(IOError):
+                self._async_run(self.exchange._place_order(
+                    order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
 
     def test_place_order_rest_missing_fields_raises(self):
         self._set_symbol_map()
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"order_id": 1})  # no timestampms
-        with self.assertRaises(IOError):
-            self._async_run(self.exchange._place_order(
-                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            with self.assertRaises(IOError):
+                self._async_run(self.exchange._place_order(
+                    order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
 
     def test_place_cancel_rest_error_result_raises(self):
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "SomethingBad"})
-        with self.assertRaises(IOError):
-            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            with self.assertRaises(IOError):
+                self._async_run(self.exchange._place_cancel("HBOT1", order))
 
     def test_place_cancel_rest_order_not_found_tagged(self):
         # An error result whose reason is OrderNotFound is re-tagged so the lost-order predicate matches.
@@ -534,8 +587,9 @@ class GeminiExchangeTests(TestCase):
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(
             return_value={"result": "error", "reason": CONSTANTS.ORDER_NOT_FOUND_ERROR})
-        with self.assertRaises(IOError) as ctx:
-            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            with self.assertRaises(IOError) as ctx:
+                self._async_run(self.exchange._place_cancel("HBOT1", order))
         self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(ctx.exception))
 
     def test_place_cancel_rest_invalid_exchange_id_raises(self):
@@ -544,8 +598,9 @@ class GeminiExchangeTests(TestCase):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="abc")
         self._mock_send_rpc(side_effect=IOError("socket down"))
         self.exchange._api_post = AsyncMock(return_value={"is_cancelled": True})
-        with self.assertRaises(ValueError):
-            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        with patch.object(CONSTANTS, "WS_ORDER_OPS_REQUIRED", False):
+            with self.assertRaises(ValueError):
+                self._async_run(self.exchange._place_cancel("HBOT1", order))
 
     # ------------------------------------------------------------------
     # Market orders + lost-order recovery (NEW-CRIT-1/2/6)
@@ -598,28 +653,68 @@ class GeminiExchangeTests(TestCase):
 
     def test_reconcile_unknown_placement_found(self):
         self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()  # don't actually sleep on retry/backoff
         self.exchange._api_post = AsyncMock(
             return_value={"order_id": 9876, "timestampms": 1700000000000})
         o_id, ts = self._async_run(
             self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
         self.assertEqual("9876", o_id)
         self.assertEqual(1700000000.0, ts)
+        # Found on the first attempt: no backoff sleep.
+        self.exchange._sleep.assert_not_called()
         # Queried REST order/status by client_order_id.
         _, kwargs = self.exchange._api_post.call_args
         self.assertEqual("HBOT1", kwargs["data"]["client_order_id"])
         self.assertEqual(CONSTANTS.ORDER_STATUS_PATH_URL, kwargs["data"]["request"])
 
+    def test_reconcile_unknown_placement_found_on_second_attempt(self):
+        # NEW-CRIT-E: a SENT-but-unconfirmed order may be live but momentarily invisible to REST
+        # (read-after-write lag). A first not-found must NOT be fatal — reconcile retries and adopts
+        # the id once the order materializes on the second attempt.
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(side_effect=[
+            {"result": "error", "reason": "OrderNotFound"},                 # 1st: not yet visible
+            {"order_id": 9876, "timestampms": 1700000000000},               # 2nd: found
+        ])
+        o_id, ts = self._async_run(
+            self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual("9876", o_id)
+        self.assertEqual(1700000000.0, ts)
+        self.assertEqual(2, self.exchange._api_post.await_count)
+        self.exchange._sleep.assert_awaited_once_with(CONSTANTS.RECONCILE_BACKOFF_SECONDS)
+
+    def test_reconcile_unknown_placement_retries_transient_rest_error_then_succeeds(self):
+        # A transient REST exception is retried (not immediately fatal); the order may still be live.
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(side_effect=[
+            IOError("rest blip"),                                            # 1st: transient error
+            {"order_id": 555, "timestampms": 1700000000000},                # 2nd: found
+        ])
+        o_id, ts = self._async_run(
+            self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual("555", o_id)
+        self.assertEqual(2, self.exchange._api_post.await_count)
+        self.exchange._sleep.assert_awaited_once()
+
     def test_reconcile_unknown_placement_error_raises(self):
         self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
         self.exchange._api_post = AsyncMock(return_value={"result": "error", "reason": "boom"})
         with self.assertRaises(IOError):
             self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        # Exhausted all attempts before giving up.
+        self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
 
     def test_reconcile_unknown_placement_not_found_raises(self):
+        # Not found after ALL attempts (genuinely unplaced) => IOError.
         self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
         self.exchange._api_post = AsyncMock(return_value={"is_live": True})  # no order_id
         with self.assertRaises(IOError):
             self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
 
     def test_place_order_no_id_event_timeout_reconciles(self):
         # No id in the reply AND the orders@account NEW event never arrives within the timeout:
@@ -641,6 +736,7 @@ class GeminiExchangeTests(TestCase):
         # Same timeout routing, but reconciliation finds nothing (genuinely-unplaced order) => the
         # IOError from _reconcile_unknown_placement propagates rather than being swallowed.
         self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()  # reconcile retries with backoff; don't actually sleep
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
         self._mock_send_rpc(return_value={})
         order.get_exchange_order_id = AsyncMock(side_effect=asyncio.TimeoutError)
@@ -773,6 +869,15 @@ class GeminiExchangeTests(TestCase):
             "order_id": 123, "is_cancelled": False, "is_live": False,
             "remaining_amount": "0.5", "executed_amount": "0"})
         self.assertEqual(OrderState.FAILED, update.new_state)
+
+    def test_request_order_status_partial_then_terminated_maps_to_canceled(self):
+        # CONC-2: not live, not cancelled, remaining > 0 BUT already partially executed => the order
+        # was terminated after a partial fill. Its fills are real, so the terminal label is CANCELED,
+        # NOT FAILED (which we reserve for executed == 0).
+        update = self._request_status({
+            "order_id": 123, "is_cancelled": False, "is_live": False,
+            "remaining_amount": "0.5", "executed_amount": "0.5"})
+        self.assertEqual(OrderState.CANCELED, update.new_state)
 
     def test_request_order_status_error_result_raises(self):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
@@ -971,7 +1076,7 @@ class GeminiExchangeTests(TestCase):
         # kill the listener — a SECOND, well-formed event delivered after it is still processed.
         # REST status/trade polling is the reconciliation path for the dropped event.
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123", amount="1")
-        bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
+        bad_event = {"X": "FILLED", "c": "HBOT1", "z": "not-a-number", "t": "t1"}
         good_event = self._make_fill_event(
             client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
             status="PARTIALLY_FILLED", cumulative_z="0.4", last_price="100", trade_id="trade-good")
@@ -990,7 +1095,7 @@ class GeminiExchangeTests(TestCase):
     def test_user_stream_listener_does_not_sleep_on_error(self):
         # CRIT-1: a malformed event must not stall the queue with a 5s sleep.
         self.exchange._sleep = AsyncMock()
-        bad_event = {"X": "FILLED", "c": "HBOT1", "Z": "not-a-number", "t": "t1"}
+        bad_event = {"X": "FILLED", "c": "HBOT1", "z": "not-a-number", "t": "t1"}
         self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         self._drive_user_stream([bad_event])
         self.exchange._sleep.assert_not_called()
