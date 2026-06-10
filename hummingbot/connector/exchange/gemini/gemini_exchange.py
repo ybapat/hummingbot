@@ -102,14 +102,20 @@ class GeminiExchange(ExchangePyBase):
 
     @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
-        return True
+        # Canary-confirmed: order.cancel replies with a bare empty ack ({"orderId":"","symbol":"",
+        # "status":""}) for both real and bogus orders — it carries no success bool and no not-found
+        # error. The ack therefore cannot confirm terminal cancellation; the orders@account CANCELED
+        # event (or status polling) finalizes it. So the cancel request is NOT synchronous.
+        return False
 
     @property
     def is_trading_required(self) -> bool:
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        # MARKET is intentionally unsupported: the Gemini Fast API rejects type=MARKET for every TIF
+        # (canary-confirmed -2010/-1013), and REST has no market type.
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         # Gemini doesn't have a bulk ticker endpoint, so we return an empty list
@@ -192,22 +198,18 @@ class GeminiExchange(ExchangePyBase):
         # Gemini Fast API order.place uses a Binance-style camelCase schema. Note the symbol is sent
         # LOWERCASE (e.g. btcusd) — the symbol from the map is already lowercase, matching REST and the
         # @trade/@depth streams.
+        # Only LIMIT/LIMIT_MAKER reach here — MARKET is unsupported (Fast API rejects type=MARKET).
         params = {
             "symbol": symbol,
             "side": CONSTANTS.WS_SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.WS_SIDE_SELL,
             "quantity": f"{amount:f}",
             "clientOrderId": order_id,
-        }
-        if order_type == OrderType.MARKET:
-            # Market orders carry no price; IOC is our market-order TIF.
-            params["type"] = CONSTANTS.WS_ORDER_TYPE_MARKET
-            params["timeInForce"] = CONSTANTS.WS_TIF_IOC
-        else:
-            params["type"] = CONSTANTS.WS_ORDER_TYPE_LIMIT
-            params["price"] = f"{price:f}"
-            params["timeInForce"] = (
+            "type": CONSTANTS.WS_ORDER_TYPE_LIMIT,
+            "price": f"{price:f}",
+            "timeInForce": (
                 CONSTANTS.WS_TIF_MAKER_OR_CANCEL if order_type == OrderType.LIMIT_MAKER
-                else CONSTANTS.WS_TIF_GTC)
+                else CONSTANTS.WS_TIF_GTC),
+        }
 
         try:
             result = await self._user_stream_rpc.send_rpc(
@@ -221,8 +223,6 @@ class GeminiExchange(ExchangePyBase):
             if not CONSTANTS.WS_ORDER_OPS_REQUIRED:
                 self.logger().warning(
                     f"WS order.place transport failure for {order_id}; falling back to REST.")
-                # For MARKET orders the REST fallback raises (Gemini REST has no market type), which is
-                # correct — there is no safe REST equivalent.
                 return await self._place_order_rest(
                     order_id, trading_pair, amount, trade_type, order_type, price)
             raise
@@ -238,9 +238,13 @@ class GeminiExchange(ExchangePyBase):
         o_id = result.get("order_id")
         if o_id is None:
             o_id = result.get("orderId")
-        # Reply timestamp is name-based (NEW-CRIT-6): "timestampms" is ms; a bare "timestamp" has an
-        # unconfirmed unit, so accept it only when it lands within ~1 day of the wall clock.
-        if "timestampms" in result:
+        # Reply timestamp is name-based (NEW-CRIT-6). Canary-confirmed: the order.place success reply
+        # carries "transactTime" in NANOSECONDS, so read it FIRST and divide by 1e9. Fall back to
+        # "timestampms" (ms) and finally a bare "timestamp" whose unit is unconfirmed (accepted only
+        # when it lands within ~1 day of the wall clock).
+        if "transactTime" in result:
+            transact_time = float(result["transactTime"]) / 1e9
+        elif "timestampms" in result:
             transact_time = float(result["timestampms"]) * 1e-3
         elif "timestamp" in result:
             raw = float(result["timestamp"])
@@ -284,11 +288,15 @@ class GeminiExchange(ExchangePyBase):
         we raise ``IOError`` so a genuinely-unplaced order still fails loudly rather than being
         silently treated as live.
 
-        Because this is the recovery path for a SENT-but-unconfirmed order (the order may be LIVE on
-        Gemini), a single immediate query can race read-after-write lag and wrongly conclude the order
-        does not exist. So we retry up to ``RECONCILE_MAX_ATTEMPTS`` with a short backoff, treating both
-        a definitive not-found AND a transient REST error as retryable; only after the last attempt do
-        we raise (NEW-CRIT-E).
+        Canary-confirmed: REST ``/v1/order/status`` queried by ``client_order_id`` returns a JSON
+        LIST (``[{...}]``) and resolves immediately (lag is effectively zero, so attempt 1 normally
+        succeeds). We normalize that list to the matching row before the dict logic runs, and a row
+        may carry its assigned id under ``order_id`` OR ``id``. The retry loop stays as a safety net:
+        because this is the recovery path for a SENT-but-unconfirmed order (the order may be LIVE on
+        Gemini), a single immediate query could in principle race read-after-write lag and wrongly
+        conclude the order does not exist, so we retry up to ``RECONCILE_MAX_ATTEMPTS`` with a short
+        backoff, treating both a definitive not-found AND a transient REST error as retryable; only
+        after the last attempt do we raise (NEW-CRIT-E).
         """
         last_detail: Any = None
         for attempt in range(1, CONSTANTS.RECONCILE_MAX_ATTEMPTS + 1):
@@ -305,10 +313,24 @@ class GeminiExchange(ExchangePyBase):
                 # live, so we give read-after-write lag another chance before giving up.
                 last_detail = e
             else:
-                if resp.get("result") != "error" and "order_id" in resp:
-                    transact_ms = resp.get("timestampms")
-                    transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
-                    return str(resp["order_id"]), transact_time
+                # The status-by-client_order_id surface returns a LIST. Pick the row whose
+                # client_order_id matches (fall back to the first row); an empty list is not-found.
+                if isinstance(resp, list):
+                    if not resp:
+                        last_detail = resp
+                        resp = None
+                    else:
+                        resp = next(
+                            (row for row in resp
+                             if isinstance(row, dict) and row.get("client_order_id") == order_id),
+                            resp[0])
+                if isinstance(resp, dict) and resp.get("result") != "error":
+                    # A row may carry the assigned id under "order_id" or "id".
+                    o_id = resp.get("order_id", resp.get("id"))
+                    if o_id is not None:
+                        transact_ms = resp.get("timestampms")
+                        transact_time = float(transact_ms) * 1e-3 if transact_ms else self.current_timestamp
+                        return str(o_id), transact_time
                 last_detail = resp
 
             if attempt < CONSTANTS.RECONCILE_MAX_ATTEMPTS:
@@ -329,10 +351,6 @@ class GeminiExchange(ExchangePyBase):
                                 trade_type: TradeType,
                                 order_type: OrderType,
                                 price: Decimal) -> Tuple[str, float]:
-        if order_type == OrderType.MARKET:
-            raise IOError(
-                "Gemini REST fallback cannot place MARKET orders; WS order entry is required for "
-                "market orders.")
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         side = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
 
@@ -374,7 +392,9 @@ class GeminiExchange(ExchangePyBase):
             await tracked_order.get_exchange_order_id()
 
         try:
-            cancel_result = await self._user_stream_rpc.send_rpc(
+            # The bare-ack reply body is empty and carries no confirmation, so it is intentionally
+            # discarded — a successful send is what matters (see the return below).
+            await self._user_stream_rpc.send_rpc(
                 method=CONSTANTS.WS_METHOD_ORDER_CANCEL,
                 # Validate/normalize the id exactly as the REST path does (_to_gemini_order_id), so a
                 # missing/non-numeric id fails loudly instead of sending {"orderId": "None"}.
@@ -391,10 +411,13 @@ class GeminiExchange(ExchangePyBase):
                 return await self._place_cancel_rest(tracked_order)
             raise
 
-        # is_cancel_request_in_exchange_synchronous is True, so a truthy return flips the order to
-        # CANCELED synchronously. Confirm only on an explicit cancelled flag; otherwise return False
-        # and let the orders@account CANCELED event drive the terminal state.
-        return bool(cancel_result.get("is_cancelled", cancel_result.get("cancelled", False)))
+        # Canary-confirmed: order.cancel replies with a bare empty ack ({"orderId":"","symbol":"",
+        # "status":""}) carrying no success bool, so the reply body cannot confirm cancellation. A
+        # successful (2xx) send means the request was ACCEPTED; the terminal CANCELED state arrives
+        # via the orders@account stream / status polling (is_cancel_request_in_exchange_synchronous
+        # is False). A genuine reject already raised GeminiWSRPCError above, so reaching here is a
+        # success.
+        return True
 
     async def _place_cancel_rest(self, tracked_order: InFlightOrder) -> bool:
         api_params = {
@@ -490,17 +513,17 @@ class GeminiExchange(ExchangePyBase):
                     order_status = event_message.get("X", "")
                     client_order_id = event_message.get("c", "")
 
-                    # When a fill occurs, extract fill details from WS event fields.
-                    # This is a Binance-style executionReport, so the cumulative fields are:
-                    #   z = CUMULATIVE FILLED BASE quantity for the order (what we delta against
-                    #       executed_amount_base — NOT uppercase "Z")
-                    #   Z = CUMULATIVE QUOTE spent (Σ price×qty) — not used here
+                    # When a fill occurs, extract fill details from WS event fields. Per the live
+                    # sandbox canary (2026-06-10) the Gemini executionReport fields are:
+                    #   z = REMAINING base quantity (NOT cumulative filled)
+                    #   Z = cumulative executed base — but its cumulative-vs-last-execution semantics on
+                    #       a MULTI-execution fill are unconfirmed, so we deliberately do NOT read it
                     #   L = price of the most recent execution (last fill price)
                     #   t = trade ID for the most recent execution
-                    # Because `update_with_trade_update` accumulates `fill_base_amount`,
-                    # we must convert the cumulative base `z` into a per-fill delta by
-                    # subtracting what we've already tracked for this order. We also
-                    # require a stable `t` to safely dedupe duplicate/stale events.
+                    # Fills omit the order quantity `q`, so the robust cumulative-filled base is the
+                    # tracked order amount minus remaining (amount - z). We delta that against
+                    # executed_amount_base (update_with_trade_update accumulates fill_base_amount) and
+                    # require a stable `t` to dedupe duplicate/stale events.
                     if order_status in ("PARTIALLY_FILLED", "FILLED"):
                         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                         trade_id_raw = event_message.get("t")
@@ -514,9 +537,16 @@ class GeminiExchange(ExchangePyBase):
                                 f"{order_status}); skipping — REST polling will reconcile.")
                             continue
                         if tracked_order is not None and trade_id_raw not in (None, ""):
-                            cumulative_base = Decimal(str(event_message.get("z", "0")))
+                            remaining_raw = event_message.get("z")
+                            if remaining_raw is None:
+                                self.logger().error(
+                                    f"Gemini fill event for {client_order_id} missing 'z' (remaining "
+                                    f"base); skipping — REST polling will reconcile.")
+                                continue
+                            remaining = Decimal(str(remaining_raw))
+                            cumulative_filled = max(Decimal("0"), tracked_order.amount - remaining)
                             prior_filled = tracked_order.executed_amount_base
-                            fill_amount = max(Decimal("0"), cumulative_base - prior_filled)
+                            fill_amount = max(Decimal("0"), cumulative_filled - prior_filled)
                             if fill_amount > Decimal("0"):
                                 fill_price = Decimal(str(event_message["L"]))
                                 # CONC-6: reject a non-finite or non-positive fill price.

@@ -10,9 +10,12 @@ from hummingbot.connector.exchange.gemini.gemini_ws_rpc import (
 
 class GeminiWSRPCErrorTests(IsolatedAsyncioWrapperTestCase):
 
-    def test_str_tags_order_not_found_for_not_found_codes(self):
+    def test_str_does_not_tag_order_not_found_for_minus_2010(self):
+        # Canary-confirmed: -2010 is a GENERAL reject (invalid pair/TIF), NOT order-not-found, and
+        # there is no WS not-found code (cancelling a nonexistent order returns an empty 200 ack).
+        # WS_ORDER_NOT_FOUND_CODES is empty, so -2010 must NOT be tagged.
         err = GeminiWSRPCError(code=-2010, status=400, message="no such order")
-        self.assertIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err))
+        self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err))
         self.assertEqual(-2010, err.code)
         self.assertEqual(400, err.status)
 
@@ -22,10 +25,11 @@ class GeminiWSRPCErrorTests(IsolatedAsyncioWrapperTestCase):
         err_none = GeminiWSRPCError(code=None, status=500, message="boom")
         self.assertNotIn(CONSTANTS.ORDER_NOT_FOUND_ERROR, str(err_none))
 
-    def test_is_order_not_found_true_for_not_found_codes(self):
-        for code in CONSTANTS.WS_ORDER_NOT_FOUND_CODES:
-            with self.subTest(code=code):
-                self.assertTrue(GeminiWSRPCError(code=code, status=400, message="x").is_order_not_found())
+    def test_no_ws_order_not_found_codes(self):
+        # WS has no not-found code (canary New-issue #1): the set is empty, so is_order_not_found()
+        # is always False — including for -2010, which is a general reject, not not-found.
+        self.assertEqual(set(), CONSTANTS.WS_ORDER_NOT_FOUND_CODES)
+        self.assertFalse(GeminiWSRPCError(code=-2010, status=400, message="x").is_order_not_found())
 
     def test_is_order_not_found_false_for_other_codes(self):
         self.assertFalse(GeminiWSRPCError(code=-1003, status=429, message="slow down").is_order_not_found())

@@ -31,13 +31,16 @@ class GeminiExchangeTests(TestCase):
         order_types = self.exchange.supported_order_types()
         self.assertIn(OrderType.LIMIT, order_types)
         self.assertIn(OrderType.LIMIT_MAKER, order_types)
-        self.assertIn(OrderType.MARKET, order_types)
+        # MARKET is intentionally unsupported: the Fast API rejects type=MARKET (canary-confirmed).
+        self.assertNotIn(OrderType.MARKET, order_types)
 
     def test_trading_pairs(self):
         self.assertEqual(["BTC-USD", "ETH-USD"], self.exchange.trading_pairs)
 
     def test_is_cancel_request_in_exchange_synchronous(self):
-        self.assertTrue(self.exchange.is_cancel_request_in_exchange_synchronous)
+        # Canary-confirmed: the bare-ack cancel reply cannot confirm terminal cancellation, so the
+        # cancel request is NOT synchronous; the orders@account CANCELED event finalizes it.
+        self.assertFalse(self.exchange.is_cancel_request_in_exchange_synchronous)
 
     def test_client_order_id_prefix(self):
         self.assertEqual("HBOT", self.exchange.client_order_id_prefix)
@@ -114,11 +117,13 @@ class GeminiExchangeTests(TestCase):
     @staticmethod
     def _make_fill_event(client_order_id, exchange_order_id, status,
                          cumulative_z, last_price, trade_id,
-                         event_ts_ns=1_700_000_000_000_000_000):
-        # `cumulative_z` is the cumulative FILLED BASE qty. In a Binance-style executionReport that is
-        # lowercase "z"; uppercase "Z" is the cumulative QUOTE (Σ price×qty). Set them to genuinely
-        # DIFFERENT values (base vs base×price) so a test that reads the wrong field yields wrong deltas
-        # whenever price != 1 — this keeps the fill tests discriminating.
+                         order_amount="1", event_ts_ns=1_700_000_000_000_000_000):
+        # Live-sandbox-confirmed Gemini executionReport semantics: "z" = REMAINING base qty and "Z" =
+        # cumulative executed base; the event OMITS the order qty "q" on fills. `cumulative_z` here is
+        # the cumulative FILLED base the test intends, so we emit z = order_amount - cumulative_z
+        # (remaining). The connector derives cumulative filled = tracked_order.amount - z, so it must
+        # NOT read "Z" or "q". No "q" key is emitted, matching the real fill frame.
+        remaining = Decimal(str(order_amount)) - Decimal(str(cumulative_z))
         return {
             "e": "executionReport",
             "E": event_ts_ns,
@@ -129,9 +134,8 @@ class GeminiExchangeTests(TestCase):
             "o": "LIMIT",
             "X": status,
             "p": "100",
-            "q": "1",
-            "z": str(cumulative_z),
-            "Z": str(Decimal(str(cumulative_z)) * Decimal(str(last_price))),
+            "z": str(remaining),            # REMAINING base (Gemini semantics)
+            "Z": str(cumulative_z),         # cumulative executed base (realism; connector must not read it)
             "L": str(last_price),
             "t": trade_id,
             "T": event_ts_ns,
@@ -183,43 +187,34 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(Decimal("0.7"), second_fill.fill_base_amount)
         self.assertEqual(Decimal("101"), second_fill.fill_price)
 
-    def test_user_stream_fill_reads_cumulative_base_not_quote(self):
-        # NEW-CRIT-A: the fill delta must come from the cumulative BASE field ("z"), NOT the
-        # cumulative QUOTE field ("Z" = Σ price×qty). With price=100/101 the two fields diverge
-        # wildly, so reading the wrong one would yield deltas of 30/71 instead of 0.3/0.7.
+    def test_user_stream_fill_derives_filled_from_remaining(self):
+        # Canary-confirmed: Gemini's "z" is REMAINING base, NOT cumulative filled. The connector must
+        # compute cumulative filled = tracked order amount - z. With amount=1 and remaining z=0.7 the
+        # recorded fill is 0.3 — NOT 0.7 (which is what wrongly reading "z" as cumulative-filled gives,
+        # the regression this guards against).
         order = self._start_tracking_limit_buy(amount="1")
 
         partial = self._make_fill_event(
             client_order_id=order.client_order_id,
             exchange_order_id=order.exchange_order_id,
             status="PARTIALLY_FILLED",
-            cumulative_z="0.3",   # base; Z becomes 30
+            cumulative_z="0.3",          # cumulative FILLED the test intends -> emitted z = 1 - 0.3 = 0.7
             last_price="100",
             trade_id="trade-1",
+            order_amount="1",
         )
-        full = self._make_fill_event(
-            client_order_id=order.client_order_id,
-            exchange_order_id=order.exchange_order_id,
-            status="FILLED",
-            cumulative_z="1.0",   # base; Z becomes 101 at price 101
-            last_price="101",
-            trade_id="trade-2",
-        )
-        # Sanity: z and Z genuinely differ so the test discriminates between them.
-        self.assertNotEqual(partial["z"], partial["Z"])
-        self.assertNotEqual(full["z"], full["Z"])
+        # The wire field is REMAINING (0.7), and there is no "q" on a fill frame.
+        self.assertEqual("0.7", partial["z"])
+        self.assertNotIn("q", partial)
 
-        self._drive_user_stream([partial, full])
+        self._drive_user_stream([partial])
 
         first_fill = order.order_fills["trade-1"]
-        second_fill = order.order_fills["trade-2"]
-        # Base deltas come from "z" (0.3 then 0.7), NOT from "Z" (30 then 71).
+        # filled = amount(1) - remaining(0.7) = 0.3, NOT the raw remaining 0.7.
         self.assertEqual(Decimal("0.3"), first_fill.fill_base_amount)
-        self.assertEqual(Decimal("0.7"), second_fill.fill_base_amount)
-        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+        self.assertEqual(Decimal("0.3"), order.executed_amount_base)
         # fill_quote_amount = base_delta * last fill price.
         self.assertEqual(Decimal("0.3") * Decimal("100"), first_fill.fill_quote_amount)
-        self.assertEqual(Decimal("0.7") * Decimal("101"), second_fill.fill_quote_amount)
 
     def test_user_stream_duplicate_fill_event_ignored(self):
         order = self._start_tracking_limit_buy(amount="1")
@@ -475,7 +470,10 @@ class GeminiExchangeTests(TestCase):
                     trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
         rest.assert_not_called()
 
-    def test_place_cancel_returns_true_on_explicit_flag(self):
+    def test_place_cancel_returns_true_on_successful_send(self):
+        # Canary-confirmed: order.cancel replies with a bare empty ack. A successful (non-raising)
+        # WS send means the request was accepted, so _place_cancel returns True regardless of the
+        # reply body; the terminal CANCELED state arrives via the orders@account stream.
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         send_rpc = self._mock_send_rpc(return_value={"is_cancelled": True})
@@ -483,17 +481,20 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual(CONSTANTS.WS_METHOD_ORDER_CANCEL, send_rpc.call_args.kwargs["method"])
         self.assertEqual({"orderId": "123"}, send_rpc.call_args.kwargs["params"])
 
-    def test_place_cancel_returns_true_on_cancelled_alias(self):
-        self._set_symbol_map()
-        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
-        self._mock_send_rpc(return_value={"cancelled": True})
-        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
-
-    def test_place_cancel_returns_false_without_confirmation(self):
+    def test_place_cancel_returns_true_on_any_reply_body(self):
+        # A reply body lacking any cancellation flag (e.g. a status string) still returns True.
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
         self._mock_send_rpc(return_value={"status": "accepted"})
-        self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
+
+    def test_place_cancel_returns_true_on_bare_ack(self):
+        # The real bare empty ack ({"orderId":"","symbol":"","status":""}) still returns True — the
+        # send was accepted; cancellation is confirmed only by the orders@account CANCELED event.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self._mock_send_rpc(return_value={"orderId": "", "symbol": "", "status": ""})
+        self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
 
     def test_place_cancel_transport_error_falls_back_to_rest(self):
         self._set_symbol_map()
@@ -505,18 +506,22 @@ class GeminiExchangeTests(TestCase):
             self.assertTrue(self._async_run(self.exchange._place_cancel("HBOT1", order)))
         self.exchange._api_post.assert_awaited_once()
 
-    def test_place_cancel_not_found_propagates_and_matches_predicate(self):
+    def test_place_cancel_ws_reject_propagates_as_failure_not_not_found(self):
+        # Canary-confirmed: WS has no order-not-found code. A WS cancel reject (e.g. -2010, a GENERAL
+        # reject) propagates as a genuine FAILURE and must NOT match the cancel not-found predicate.
+        # The REST string-based "OrderNotFound" path is the only not-found detector (see
+        # test_place_cancel_rest_order_not_found_tagged).
         self._set_symbol_map()
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
-        err = GeminiWSRPCError(code=-2010, status=400, message="not found")
+        err = GeminiWSRPCError(code=-2010, status=400, message="rejected")
         self._mock_send_rpc(side_effect=err)
         rest = AsyncMock()
         self.exchange._api_post = rest
         with self.assertRaises(GeminiWSRPCError):
             self._async_run(self.exchange._place_cancel("HBOT1", order))
         rest.assert_not_called()
-        # The not-found error must satisfy the connector's lost-order predicate.
-        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(err))
+        # The WS reject does NOT satisfy the connector's lost-order predicate (no WS not-found code).
+        self.assertFalse(self.exchange._is_order_not_found_during_cancelation_error(err))
 
     def test_place_cancel_transport_error_propagates_when_ws_required(self):
         self._set_symbol_map()
@@ -603,34 +608,9 @@ class GeminiExchangeTests(TestCase):
                 self._async_run(self.exchange._place_cancel("HBOT1", order))
 
     # ------------------------------------------------------------------
-    # Market orders + lost-order recovery (NEW-CRIT-1/2/6)
+    # Lost-order recovery (NEW-CRIT-1/2/6). MARKET is unsupported (Fast API rejects type=MARKET), so
+    # there are no MARKET placement tests.
     # ------------------------------------------------------------------
-
-    def test_place_order_market_sends_market_schema(self):
-        # MARKET: type=MARKET, timeInForce=IOC, NO price key, lowercase symbol, quantity present.
-        self._set_symbol_map()
-        send_rpc = self._mock_send_rpc(
-            return_value={"order_id": 9876, "timestampms": 1700000000000})
-        self._async_run(self.exchange._place_order(
-            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-            trade_type=TradeType.BUY, order_type=OrderType.MARKET, price=Decimal("0")))
-        params = send_rpc.call_args.kwargs["params"]
-        self.assertEqual("btcusd", params["symbol"])
-        self.assertEqual(CONSTANTS.WS_ORDER_TYPE_MARKET, params["type"])
-        self.assertEqual(CONSTANTS.WS_TIF_IOC, params["timeInForce"])
-        self.assertEqual("1", params["quantity"])
-        self.assertEqual("HBOT1", params["clientOrderId"])
-        self.assertNotIn("price", params)
-
-    def test_place_order_rest_raises_for_market(self):
-        # Gemini REST cannot place market orders; the fallback path must reject loudly.
-        self._set_symbol_map()
-        self.exchange._api_post = AsyncMock()
-        with self.assertRaises(IOError):
-            self._async_run(self.exchange._place_order_rest(
-                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
-                trade_type=TradeType.BUY, order_type=OrderType.MARKET, price=Decimal("0")))
-        self.exchange._api_post.assert_not_called()
 
     def test_place_order_post_send_error_reconciles_without_rest_replace(self):
         # NEW-CRIT-1: a lost reply (request was SENT) must NOT re-place over REST; it reconciles
@@ -652,10 +632,11 @@ class GeminiExchangeTests(TestCase):
         self.exchange._place_order_rest.assert_not_called()
 
     def test_reconcile_unknown_placement_found(self):
+        # Canary-confirmed: REST /v1/order/status by client_order_id returns a JSON LIST.
         self._set_symbol_map()
         self.exchange._sleep = AsyncMock()  # don't actually sleep on retry/backoff
         self.exchange._api_post = AsyncMock(
-            return_value={"order_id": 9876, "timestampms": 1700000000000})
+            return_value=[{"order_id": 9876, "client_order_id": "HBOT1", "timestampms": 1700000000000}])
         o_id, ts = self._async_run(
             self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
         self.assertEqual("9876", o_id)
@@ -667,15 +648,38 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual("HBOT1", kwargs["data"]["client_order_id"])
         self.assertEqual(CONSTANTS.ORDER_STATUS_PATH_URL, kwargs["data"]["request"])
 
+    def test_reconcile_unknown_placement_picks_matching_client_order_id_row(self):
+        # The list may carry more than one row; pick the one whose client_order_id matches.
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"order_id": 111, "client_order_id": "OTHER", "timestampms": 1600000000000},
+            {"order_id": 9876, "client_order_id": "HBOT1", "timestampms": 1700000000000},
+        ])
+        o_id, ts = self._async_run(
+            self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual("9876", o_id)
+        self.assertEqual(1700000000.0, ts)
+
+    def test_reconcile_unknown_placement_row_id_under_id_key(self):
+        # A row may carry its assigned id under "id" instead of "order_id".
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(
+            return_value=[{"id": 4321, "client_order_id": "HBOT1", "timestampms": 1700000000000}])
+        o_id, _ = self._async_run(
+            self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual("4321", o_id)
+
     def test_reconcile_unknown_placement_found_on_second_attempt(self):
         # NEW-CRIT-E: a SENT-but-unconfirmed order may be live but momentarily invisible to REST
         # (read-after-write lag). A first not-found must NOT be fatal — reconcile retries and adopts
-        # the id once the order materializes on the second attempt.
+        # the id once the order materializes (as a LIST row) on the second attempt.
         self._set_symbol_map()
         self.exchange._sleep = AsyncMock()
         self.exchange._api_post = AsyncMock(side_effect=[
-            {"result": "error", "reason": "OrderNotFound"},                 # 1st: not yet visible
-            {"order_id": 9876, "timestampms": 1700000000000},               # 2nd: found
+            [],                                                                          # 1st: not yet visible
+            [{"order_id": 9876, "client_order_id": "HBOT1", "timestampms": 1700000000000}],  # 2nd: found
         ])
         o_id, ts = self._async_run(
             self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
@@ -689,8 +693,8 @@ class GeminiExchangeTests(TestCase):
         self._set_symbol_map()
         self.exchange._sleep = AsyncMock()
         self.exchange._api_post = AsyncMock(side_effect=[
-            IOError("rest blip"),                                            # 1st: transient error
-            {"order_id": 555, "timestampms": 1700000000000},                # 2nd: found
+            IOError("rest blip"),                                                        # 1st: transient error
+            [{"order_id": 555, "client_order_id": "HBOT1", "timestampms": 1700000000000}],   # 2nd: found
         ])
         o_id, ts = self._async_run(
             self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
@@ -707,11 +711,21 @@ class GeminiExchangeTests(TestCase):
         # Exhausted all attempts before giving up.
         self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
 
-    def test_reconcile_unknown_placement_not_found_raises(self):
-        # Not found after ALL attempts (genuinely unplaced) => IOError.
+    def test_reconcile_unknown_placement_empty_list_raises(self):
+        # An EMPTY list is treated as not-found: after exhausting all attempts, IOError is raised.
         self._set_symbol_map()
         self.exchange._sleep = AsyncMock()
-        self.exchange._api_post = AsyncMock(return_value={"is_live": True})  # no order_id
+        self.exchange._api_post = AsyncMock(return_value=[])
+        with self.assertRaises(IOError):
+            self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
+        self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
+
+    def test_reconcile_unknown_placement_not_found_raises(self):
+        # Not found after ALL attempts (genuinely unplaced) => IOError. A list row with no id is
+        # treated as not-found.
+        self._set_symbol_map()
+        self.exchange._sleep = AsyncMock()
+        self.exchange._api_post = AsyncMock(return_value=[{"is_live": True}])  # no order_id/id
         with self.assertRaises(IOError):
             self._async_run(self.exchange._reconcile_unknown_placement("HBOT1", "BTC-USD"))
         self.assertEqual(CONSTANTS.RECONCILE_MAX_ATTEMPTS, self.exchange._api_post.await_count)
@@ -724,8 +738,9 @@ class GeminiExchangeTests(TestCase):
         order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id=None)
         self._mock_send_rpc(return_value={})
         order.get_exchange_order_id = AsyncMock(side_effect=asyncio.TimeoutError)
+        # REST order/status returns a LIST (canary-confirmed shape).
         self.exchange._api_post = AsyncMock(
-            return_value={"order_id": 888, "timestampms": 1700000000000})
+            return_value=[{"order_id": 888, "client_order_id": "HBOT1", "timestampms": 1700000000000}])
         o_id, ts = self._async_run(self.exchange._place_order(
             order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
             trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
@@ -753,7 +768,9 @@ class GeminiExchangeTests(TestCase):
         self._set_symbol_map()
         self._mock_send_rpc(return_value={})  # no id, order is not tracked
         self.exchange._set_current_timestamp(12345.0)
-        self.exchange._api_post = AsyncMock(return_value={"order_id": 999})  # no timestampms
+        # REST order/status returns a LIST whose row omits timestampms.
+        self.exchange._api_post = AsyncMock(
+            return_value=[{"order_id": 999, "client_order_id": "HBOT1"}])  # no timestampms
         o_id, ts = self._async_run(self.exchange._place_order(
             order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
             trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
@@ -771,6 +788,17 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual("777", o_id)
         self.assertEqual(12.0, ts)
         self.exchange._reconcile_unknown_placement.assert_awaited_once()
+
+    def test_place_order_transact_time_nanoseconds(self):
+        # Canary-confirmed New-issue #2: the order.place success reply carries "transactTime" in
+        # NANOSECONDS, read FIRST and divided by 1e9 -> seconds. It also wins over timestampms.
+        self._set_symbol_map()
+        self._mock_send_rpc(return_value={
+            "order_id": 1, "transactTime": 1700000000123456789, "timestampms": 9999999999999})
+        _, ts = self._async_run(self.exchange._place_order(
+            order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.assertEqual(1700000000123456789 / 1e9, ts)
 
     def test_place_order_timestampms_is_name_based_no_heuristic(self):
         # NEW-CRIT-6: timestampms reply -> transact_time == timestampms * 1e-3 (no magnitude guess).
@@ -801,10 +829,12 @@ class GeminiExchangeTests(TestCase):
             _ = self.exchange._user_stream_rpc
 
     def test_order_not_found_predicate_typed(self):
-        # NEW-CONC-7: a GeminiWSRPCError tagged not-found satisfies the predicate via the typed check.
+        # Canary-confirmed: WS has no order-not-found code (WS_ORDER_NOT_FOUND_CODES is empty), so a
+        # GeminiWSRPCError -- including -2010, a general reject -- does NOT satisfy the typed
+        # not-found predicate. Only the REST "OrderNotFound" string path detects not-found.
         err = GeminiWSRPCError(code=-2010, status=400, message="gone")
-        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(err))
-        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(err))
+        self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(err))
+        self.assertFalse(self.exchange._is_order_not_found_during_cancelation_error(err))
 
     # ------------------------------------------------------------------
     # Trading rules

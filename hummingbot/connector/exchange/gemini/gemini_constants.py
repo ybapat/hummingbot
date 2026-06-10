@@ -72,9 +72,8 @@ RECONCILE_BACKOFF_SECONDS = 0.5
 WS_SIDE_BUY = "BUY"
 WS_SIDE_SELL = "SELL"
 WS_ORDER_TYPE_LIMIT = "LIMIT"
-WS_ORDER_TYPE_MARKET = "MARKET"
 WS_TIF_GTC = "GTC"
-WS_TIF_IOC = "IOC"                # market-order TIF (sandbox-confirm FOK alternative)
+WS_TIF_IOC = "IOC"                # reserved for a future marketable-IOC-LIMIT market-order substitute (MARKET type is unsupported)
 WS_TIF_MAKER_OR_CANCEL = "MOC"    # OPEN (D7): confirm post-only/maker-or-cancel encoding against sandbox
 
 # WS RPC error codes
@@ -84,7 +83,11 @@ WS_ERR_RATE_LIMIT = -1003         # 429
 WS_ERR_INVALID_PARAM = -1013      # 400  (genuine validation reject -> FAILED, NOT a fallback signal)
 WS_ERR_UNSUPPORTED = -1020        # 400
 WS_ERR_ORDER_REJECT = -2010       # 400
-WS_ORDER_NOT_FOUND_CODES = {-2010}   # OPEN (D8): verify exact not-found code/msg against sandbox
+# Canary-confirmed: -2010 is a GENERAL reject (invalid pair/TIF), NOT order-not-found; cancelling a
+# nonexistent order returns an empty 200 ack with no error, so there is NO WS not-found code. WS
+# rejects therefore propagate as genuine failures, and REST cancel still detects not-found via the
+# "OrderNotFound" reason string (ORDER_NOT_FOUND_ERROR).
+WS_ORDER_NOT_FOUND_CODES = set()
 
 # WS throttle ids. These link to the shared account-wide ORDERS_RATE bucket (see RATE_LIMITS) so
 # WS and REST order mutations cannot collectively exceed Gemini's order limit.
@@ -100,6 +103,7 @@ ORDERS_RATE = "ORDERS_RATE"
 
 # Rate Limit intervals
 ONE_MINUTE = 60
+TEN_SECONDS = 10
 ONE_SECOND = 1
 ONE_DAY = 86400
 
@@ -152,8 +156,9 @@ def convert_timestamp_to_seconds(ts: float) -> float:
 
 
 RATE_LIMITS = [
-    RateLimit(limit_id=REQUEST_WEIGHT, limit=600, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=ORDERS_RATE, limit=100, time_interval=ONE_MINUTE),
+    # Canary-confirmed conninfo account limits: ORDERS = 2000 per 10s; 30000 weight per minute.
+    RateLimit(limit_id=REQUEST_WEIGHT, limit=30000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=ORDERS_RATE, limit=2000, time_interval=TEN_SECONDS),
     RateLimit(limit_id=SYMBOLS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=SYMBOL_DETAILS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
